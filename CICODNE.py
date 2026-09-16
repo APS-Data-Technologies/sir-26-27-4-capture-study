@@ -19,7 +19,9 @@ name-matching check, and the registration logic) is built here.
 import random
 from typing import Dict
 
-
+def randomcode():
+  pinCODE = random.randint(0000, 9999)
+  return pinCODE
 # ---------------------------------------------------------------------
 # Data store
 # ---------------------------------------------------------------------
