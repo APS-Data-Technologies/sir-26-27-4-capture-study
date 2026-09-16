@@ -11,9 +11,9 @@ Run:
 then open http://localhost:5000  (or http://<this-machine-ip>:5000 from the tablet)
 
 This file is the *interface* sector — it is the "pinterface" that
-CICODNE.py expects: it collects a PIN, calls into clock_system, and
+clock_system.py expects: it collects a PIN, calls into clock_system, and
 displays whatever comes back. The clock-in/clock-out rules all live in
-CICODNE.py. Nothing in this file decides whether an entry is valid.
+clock_system.py. Nothing in this file decides whether an entry is valid.
 
 The flows it draws
 ------------------
@@ -397,9 +397,9 @@ KIOSK_HTML = """<!DOCTYPE html>
     color: var(--muted);
     margin-bottom: 6px;
   }
-  /* The caret sits at the left edge of the box, marking where typing
-     starts, then the entered digits push it along. */
-  .field-value { display: flex; align-items: center; gap: 10px; min-height: 34px; }
+  /* The caret trails the entered digits: at the left edge of the box when
+     nothing is typed, then advancing one place with every digit. */
+  .field-value { display: flex; align-items: center; min-height: 34px; }
   .caret {
     flex: 0 0 auto;
     width: 2px;
@@ -409,6 +409,8 @@ KIOSK_HTML = """<!DOCTYPE html>
   }
   @keyframes blink { 50% { opacity: 0; } }
   .dots { display: flex; gap: 12px; align-items: center; }
+  /* space before the caret only once there's a digit to sit behind */
+  .dots:not(:empty) { margin-right: 12px; }
   .dot { width: 16px; height: 16px; border-radius: 50%; background: var(--text); }
 
   /* ---------- keys ---------- */
@@ -600,8 +602,8 @@ KIOSK_HTML = """<!DOCTYPE html>
     <div class="field">
       <div class="field-label">PIN</div>
       <div class="field-value">
-        <span class="caret"></span>
         <span class="dots" id="pinDots"></span>
+        <span class="caret"></span>
       </div>
     </div>
 
@@ -646,8 +648,8 @@ KIOSK_HTML = """<!DOCTYPE html>
     <div class="field">
       <div class="field-label" id="setupLabel">New PIN</div>
       <div class="field-value">
-        <span class="caret"></span>
         <span class="dots" id="setupDots"></span>
+        <span class="caret"></span>
       </div>
     </div>
     <div class="numpad" id="setupNumpad"></div>
@@ -675,8 +677,8 @@ KIOSK_HTML = """<!DOCTYPE html>
     <div class="field">
       <div class="field-label">PIN</div>
       <div class="field-value">
-        <span class="caret"></span>
         <span class="dots" id="linkDots"></span>
+        <span class="caret"></span>
       </div>
     </div>
     <div class="numpad" id="linkNumpad"></div>
