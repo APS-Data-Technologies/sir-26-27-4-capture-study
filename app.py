@@ -24,6 +24,7 @@ RETURNING employee
     -> "No, try again" clears and returns to the numpad.
     Or they tap Sign in with Google and skip the PIN entirely.
     Or they scan their school ID card: that clocks them in or out at once.
+    Or they tap their NFC tag on the tablet (nfctag.py): same, instantly.
 
 NEW employee
     types the temporary code they were issued -> popup asks them to
@@ -54,6 +55,7 @@ from flask import (
 )
 
 import clock_system as cs
+import nfctag
 
 app = Flask(__name__)
 
@@ -144,6 +146,10 @@ def seed_demo_staff():
 
     issued = cs.register_employee("New Hire")
     cs.link_badge(issued, "100999")
+
+    # Made-up NFC tag serial, for trying a tap without real tags.
+    nfctag.link_tag("1234", "04:A2:3B:1C:5D:80:00")
+    print("[seed] Sample Person -> demo NFC tag 04:A2:3B:1C:5D:80:00")
     print(f"[seed] New Hire -> temporary code {issued}, card 100999 "
           f"(will be asked to pick a PIN)")
 
@@ -179,6 +185,10 @@ def clock_response(pin, method):
     return {"ok": False, "message": CLOCK_FAILURE_MESSAGES.get(result, result)}
 
 
+# NFC tags live in their own module; see nfctag.py for how they work.
+app.register_blueprint(nfctag.create_blueprint(clock_response, log_event))
+
+
 # =====================================================================
 # ROUTES
 # =====================================================================
@@ -212,6 +222,7 @@ def dashboard():
         today=datetime.now().strftime("%A, %B %-d, %Y"),
         new_pin=request.args.get("pin"),
         new_name=request.args.get("name"),
+        nfc_panel=nfctag.admin_panel(punches),
         notice=request.args.get("notice"),
         notice_kind=request.args.get("kind", "ok"),
     )
@@ -771,6 +782,9 @@ KIOSK_HTML = """<!DOCTYPE html>
       <span id="scanHintText">Have your school ID? Just scan it, any time.</span>
     </div>
 
+    <!-- nfctag.py draws the NFC status bar here -->
+    <div id="nfcMount"></div>
+
     <div class="banner" id="banner"></div>
    </div>
 
@@ -1227,11 +1241,33 @@ function showConfirmation(data) {
 
 // Every scan, from any source, comes through here. A camera scanner added
 // later just calls handleScan(code, "camera") with what it decoded.
+// A PIN setup, Google link or "is this you?" popup belongs to whoever is
+// using the kiosk right now; a card scan or NFC tap shouldn't clock someone
+// else in underneath it. The result screen is fine to replace: that's just
+// the next person in line.
+function kioskBusy() {
+  return el.overlay.classList.contains("show") && el.confirmPopup.hidden;
+}
+
+// Shows what the server said about a card scan or NFC tap (nfctag.py uses
+// this too): the in/out result screen, or the red banner on failure.
+function showScanResult(data) {
+  // Any half-typed PIN belonged to no one; the card or tag decides who this is.
+  state.pin = "";
+  renderPin();
+
+  if (!data.ok) {
+    clearTimeout(resetTimer);
+    closePopup();
+    showBanner(el.banner, el.entry, data.message);
+    return;
+  }
+
+  showConfirmation(data);
+}
+
 async function handleScan(code, source) {
-  // A PIN setup, Google link or "is this you?" popup belongs to whoever is
-  // using the kiosk right now; don't clock someone else in underneath it.
-  // The result screen is fine to replace: that's just the next in line.
-  if (el.overlay.classList.contains("show") && el.confirmPopup.hidden) {
+  if (kioskBusy()) {
     logEvent("scan_ignored", { source, reason: "popup open" });
     return;
   }
@@ -1246,18 +1282,7 @@ async function handleScan(code, source) {
     return;
   }
 
-  // Any half-typed PIN belonged to no one; the card decides who this is.
-  state.pin = "";
-  renderPin();
-
-  if (!data.ok) {
-    clearTimeout(resetTimer);
-    closePopup();
-    showBanner(el.banner, el.entry, data.message);
-    return;
-  }
-
-  showConfirmation(data);
+  showScanResult(data);
 }
 
 function flashScanHint() {
@@ -1373,6 +1398,7 @@ renderPin();
 tickClock();
 setInterval(tickClock, 1000);
 </script>
+<script src="/nfc/nfc.js"></script>
 </body>
 </html>
 """
@@ -1610,6 +1636,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <input type="text" name="badge" id="linkBadge" placeholder="Scan card here" autocomplete="off" required>
     <button type="submit">Link card</button>
   </form>
+  {{ nfc_panel }}
   {% endif %}
 
   <div class="panel">
@@ -1698,6 +1725,7 @@ const linkPin = document.getElementById("linkPin");
 const linkBadge = document.getElementById("linkBadge");
 if (linkPin) linkPin.addEventListener("change", () => linkBadge.focus());
 </script>
+<script src="/nfc/nfc.js"></script>
 </body>
 </html>
 """
@@ -1710,4 +1738,8 @@ if __name__ == "__main__":
         seed_demo_staff()
 
     # host="0.0.0.0" so the Android tablet on the same network can reach it.
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # Web NFC on the tablet needs https. KIOSK_HTTPS=1 python app.py serves
+    # over https with a throwaway self-signed certificate (needs the
+    # "cryptography" package); the tablet shows a warning to accept once.
+    ssl = "adhoc" if os.environ.get("KIOSK_HTTPS") == "1" else None
+    app.run(host="0.0.0.0", port=5000, debug=True, ssl_context=ssl)
