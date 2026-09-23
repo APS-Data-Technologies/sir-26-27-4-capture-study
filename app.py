@@ -2,8 +2,9 @@
 Clock-in kiosk prototype — UI layer.
 
 Two screens:
-    /           employee kiosk (PIN entry + Google sign-in)
-    /dashboard  employer view (summary tiles, staff table, registration)
+    /           employee kiosk (PIN entry, Google sign-in, ID card scan)
+    /dashboard  employer view (summary tiles, staff table, registration,
+                linking school ID cards)
 
 Run:
     pip install flask
@@ -22,14 +23,26 @@ RETURNING employee
     -> "Yes, that's me" flips the clock lever
     -> "No, try again" clears and returns to the numpad.
     Or they tap Sign in with Google and skip the PIN entirely.
+    Or they scan their school ID card: that clocks them in or out at once.
+    Or they tap their NFC tag on the tablet (nfctag.py): same, instantly.
 
 NEW employee
     types the temporary code they were issued -> popup asks them to
     choose their own 4-6 digit PIN -> a PIN that's already taken shows
     an error and they pick again.
+
+Barcode scanners
+----------------
+A USB or Bluetooth scanner acts as a keyboard: it "types" the barcode very
+fast and then presses Enter. The kiosk tells a scan apart from a person
+typing by that speed (see SCAN_MAX_GAP_MS in the kiosk script), so no
+driver or setup is needed; plug the scanner in and scan. Every scan goes
+through one function, handleScan(code, source), so a camera scanner can be
+added later by calling that same function.
 """
 
 import os
+import time
 from datetime import datetime
 
 from flask import (
@@ -42,6 +55,7 @@ from flask import (
 )
 
 import clock_system as cs
+import nfctag
 
 app = Flask(__name__)
 
@@ -85,6 +99,16 @@ def google_accounts():
 last_punch = {}
 
 
+# A scan clocks in or out instantly, so a card scanned twice in a row (a
+# double beep, or someone unsure the first one took) would clock them in
+# and straight back out. Within this window a repeat scan of the same card
+# just shows the earlier result again instead of flipping the lever.
+SCAN_COOLDOWN_SECONDS = 10
+
+# PIN -> (time.monotonic() of the scan, the response it got)
+recent_scans = {}
+
+
 def load_punches():
     """Rows for the dashboard table, built from the live clock_system store."""
     rows = []
@@ -96,6 +120,7 @@ def load_punches():
             "status": "in" if record["status"] == "clocked_in" else "out",
             "temporary": record["temporary"],
             "google": record.get("google_email") or "",
+            "badge": record.get("badge") or "",
             "time": punch.get("time", "—"),
             "method": punch.get("method", "—"),
         })
@@ -104,17 +129,29 @@ def load_punches():
 
 # Synthetic roster only — no real staff records (see README ground rules).
 def seed_demo_staff():
-    """Two staff who've set their own PIN, one still on an issued code."""
+    """Two staff who've set their own PIN, one still on an issued code.
+
+    Each gets a made-up card number so the scan flow can be tried without
+    real ID cards; link a real card from the dashboard to test hardware.
+    """
     ready = cs.register_employee("Sample Person")
     cs.set_custom_pin(ready, "1234")
-    print(f"[seed] Sample Person -> PIN 1234 (ready to clock in)")
+    cs.link_badge("1234", "100234")
+    print("[seed] Sample Person -> PIN 1234, card 100234 (ready to clock in)")
 
     ready2 = cs.register_employee("Test Employee")
     cs.set_custom_pin(ready2, "567890")
-    print(f"[seed] Test Employee -> PIN 567890 (ready to clock in)")
+    cs.link_badge("567890", "100567")
+    print("[seed] Test Employee -> PIN 567890, card 100567 (ready to clock in)")
 
     issued = cs.register_employee("New Hire")
-    print(f"[seed] New Hire -> temporary code {issued} (will be asked to pick a PIN)")
+    cs.link_badge(issued, "100999")
+
+    # Made-up NFC tag serial, for trying a tap without real tags.
+    nfctag.link_tag("1234", "04:A2:3B:1C:5D:80:00")
+    print("[seed] Sample Person -> demo NFC tag 04:A2:3B:1C:5D:80:00")
+    print(f"[seed] New Hire -> temporary code {issued}, card 100999 "
+          f"(will be asked to pick a PIN)")
 
 
 SITE_LABEL = "Main Office"
@@ -125,22 +162,31 @@ def record_punch(pin, method):
     last_punch[pin] = {"time": datetime.now().strftime("%-I:%M %p"), "method": method}
 
 
+# What the kiosk says when clock_system refuses to flip the lever.
+CLOCK_FAILURE_MESSAGES = {
+    cs.DOES_NOT_EXIST: "That code isn't registered. Check it and try again.",
+    cs.NEEDS_PIN_SETUP: "Finish setting up first: enter the code you were given on the keypad.",
+}
+
+
 def clock_response(pin, method):
-    """Flip the lever via clock_system and shape the kiosk's reply."""
+    """Flip the lever via clock_system and shape the kiosk's reply (a dict)."""
     result = cs.process_clock_entry(pin)
 
     if result in (cs.CLOCKED_IN, cs.CLOCKED_OUT):
         record_punch(cs.clean_pin(pin), method)
-        return jsonify({
+        return {
             "ok": True,
             "name": cs.employee_records[cs.clean_pin(pin)]["name"],
             "action": result,
             "time": datetime.now().strftime("%-I:%M:%S %p"),
-        })
+        }
 
-    # "Does not exist" / "needs pin setup" shouldn't reach here in normal
-    # use — the lookup step catches both — but don't lie if they do.
-    return jsonify({"ok": False, "message": result})
+    return {"ok": False, "message": CLOCK_FAILURE_MESSAGES.get(result, result)}
+
+
+# NFC tags live in their own module; see nfctag.py for how they work.
+app.register_blueprint(nfctag.create_blueprint(clock_response, log_event))
 
 
 # =====================================================================
@@ -159,6 +205,7 @@ def kiosk():
 
 
 @app.route("/dashboard")
+@app.route("/admin")
 def dashboard():
     punches = load_punches()
     counts = {
@@ -175,6 +222,9 @@ def dashboard():
         today=datetime.now().strftime("%A, %B %-d, %Y"),
         new_pin=request.args.get("pin"),
         new_name=request.args.get("name"),
+        nfc_panel=nfctag.admin_panel(punches),
+        notice=request.args.get("notice"),
+        notice_kind=request.args.get("kind", "ok"),
     )
 
 
@@ -188,6 +238,40 @@ def register():
     pin = cs.register_employee(name)
     log_event("register", {"name": name, "code": pin})
     return redirect(url_for("dashboard", pin=pin, name=name))
+
+
+@app.route("/badge/link", methods=["POST"])
+def badge_link():
+    """Employer ties a school ID card to an employee (scan it into the box)."""
+    pin = cs.clean_pin(request.form.get("pin"))
+    badge = request.form.get("badge")
+
+    result = cs.link_badge(pin, badge)
+    log_event("badge_link", {"pin": pin, "result": result})
+
+    if result == cs.BADGE_LINKED:
+        name = cs.employee_records[pin]["name"]
+        return redirect(url_for("dashboard", notice=f"ID card linked to {name}.", kind="ok"))
+
+    messages = {
+        cs.DOES_NOT_EXIST: "Pick an employee first.",
+        cs.BADGE_BAD_FORMAT: "Nothing was scanned. Click the card box, then scan the card.",
+        cs.BADGE_ALREADY_LINKED: "That card is already linked to someone else. Unlink it there first.",
+    }
+    return redirect(url_for("dashboard", notice=messages.get(result, result), kind="error"))
+
+
+@app.route("/badge/unlink", methods=["POST"])
+def badge_unlink():
+    """Employer removes a card, e.g. when it's lost or replaced."""
+    pin = cs.clean_pin(request.form.get("pin"))
+    record = cs.lookup(pin)
+    cs.unlink_badge(pin)
+    log_event("badge_unlink", {"pin": pin})
+
+    if record is None:
+        return redirect(url_for("dashboard"))
+    return redirect(url_for("dashboard", notice=f"ID card removed from {record['name']}.", kind="ok"))
 
 
 # --- kiosk API -------------------------------------------------------
@@ -222,7 +306,7 @@ def api_clock():
     """Step 2: they confirmed the name on the popup. Flip the lever."""
     pin = cs.clean_pin((request.get_json(silent=True) or {}).get("pin"))
     log_event("confirm", {"pin": pin})
-    return clock_response(pin, "PIN")
+    return jsonify(clock_response(pin, "PIN"))
 
 
 @app.route("/api/set-pin", methods=["POST"])
@@ -307,7 +391,44 @@ def api_google_clock():
     """Confirmed from a Google sign-in. Flip the lever."""
     pin = cs.clean_pin((request.get_json(silent=True) or {}).get("pin"))
     log_event("confirm", {"pin": pin, "via": "google"})
-    return clock_response(pin, "Google")
+    return jsonify(clock_response(pin, "Google"))
+
+
+# --- ID card scan ----------------------------------------------------
+
+@app.route("/api/badge/scan", methods=["POST"])
+def api_badge_scan():
+    """A card was scanned. Clock in or out straight away, no confirm step."""
+    payload = request.get_json(silent=True) or {}
+    badge = cs.normalize_badge(payload.get("badge"))
+    source = payload.get("source", "scanner")   # "scanner" now; "camera" later
+
+    pin = cs.find_by_badge(badge)
+    if pin is None:
+        log_event("badge_scan", {"badge": badge, "source": source, "result": "unknown badge"})
+        return jsonify({
+            "ok": False,
+            "message": "This ID card isn't linked to anyone yet. See your site lead.",
+        })
+
+    # Same card again within the cooldown: show the earlier result instead
+    # of clocking them straight back out.
+    now = time.monotonic()
+    previous = recent_scans.get(pin)
+    if previous and now - previous[0] < SCAN_COOLDOWN_SECONDS:
+        log_event("badge_scan", {"badge": badge, "source": source, "result": "repeat ignored"})
+        return jsonify({**previous[1], "repeat": True})
+
+    response = clock_response(pin, "Badge")
+    log_event("badge_scan", {
+        "badge": badge,
+        "source": source,
+        "result": response.get("action") or response.get("message"),
+    })
+
+    if response["ok"]:
+        recent_scans[pin] = (now, response)
+    return jsonify(response)
 
 
 @app.route("/api/log", methods=["POST"])
@@ -360,7 +481,8 @@ KIOSK_HTML = """<!DOCTYPE html>
 <title>Clock In / Out — Kiosk</title>
 <style>
 """ + BASE_CSS + """
-  html, body { height: 100%; overflow: hidden; user-select: none; }
+  html, body { height: 100%; user-select: none; }
+  body { overflow: auto; }
 
   .screen { height: 100%; display: flex; align-items: center; justify-content: center; padding: 20px; }
   .card {
@@ -475,6 +597,27 @@ KIOSK_HTML = """<!DOCTYPE html>
   .g-mark { font-size: 19px; font-weight: 700; }
   .g-note { text-align: center; font-size: 12px; color: var(--muted); }
 
+  /* ---------- ID card scan hint ---------- */
+  .scan-hint {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+    border: 1px dashed var(--line);
+    border-radius: 12px;
+    color: var(--muted);
+    font-size: 14px;
+    transition: border-color .2s, color .2s, background-color .2s;
+  }
+  .scan-hint svg { flex: 0 0 auto; }
+  /* lights up for a moment when a scan comes in */
+  .scan-hint.hit {
+    border-style: solid;
+    border-color: var(--accent);
+    color: var(--text);
+    background-color: rgba(77,141,255,.1);
+  }
+
   /* ---------- banner ---------- */
   .banner {
     border-radius: 12px;
@@ -576,6 +719,34 @@ KIOSK_HTML = """<!DOCTYPE html>
   }
   .confirm-time { font-size: 19px; color: var(--muted); font-variant-numeric: tabular-nums; }
 
+  /* ---------- fit the screen ---------- */
+  .screen { min-height: 100%; height: auto; padding: clamp(10px, 2.5vh, 20px); }
+  .card { gap: clamp(8px, 1.8vh, 18px); padding: clamp(14px, 2.6vh, 24px); }
+  .col-info, .col-pad, .col-alt { display: flex; flex-direction: column; gap: inherit; }
+  .key { min-height: clamp(44px, 7.5vh, 66px); }
+  .btn { min-height: clamp(44px, 6.5vh, 60px); }
+  .field { min-height: clamp(56px, 8.5vh, 82px); }
+  .google-btn { min-height: clamp(44px, 6vh, 58px); }
+  .admin-link { align-self: center; font-size: 12px; color: var(--muted); text-decoration: none; opacity: .7; }
+  .admin-link:hover { opacity: 1; text-decoration: underline; }
+
+  /* Landscape (laptop, tablet on its side): info + Google on the left,
+     PIN pad on the right, so nothing has to stack past the screen edge. */
+  @media (orientation: landscape) and (min-width: 820px) {
+    .card {
+      width: min(980px, 100%);
+      display: grid;
+      grid-template-columns: 1fr 1.1fr;
+      grid-template-areas: "info pad" "alt pad";
+      grid-template-rows: auto 1fr;
+      column-gap: clamp(20px, 3vw, 36px);
+    }
+    .col-info { grid-area: info; }
+    .col-pad  { grid-area: pad; justify-content: center; }
+    .col-alt  { grid-area: alt; justify-content: flex-end; }
+    .key { min-height: clamp(44px, 11vh, 76px); }
+  }
+
   @media (max-height: 680px) {
     .key { min-height: 52px; font-size: 22px; }
     .field { min-height: 68px; }
@@ -587,6 +758,7 @@ KIOSK_HTML = """<!DOCTYPE html>
 
 <div class="screen">
   <div class="card" id="entry">
+   <div class="col-info">
     <div class="head">
       <span class="site">{{ site }}</span>
       <span class="clock" id="clock">--:--</span>
@@ -594,11 +766,29 @@ KIOSK_HTML = """<!DOCTYPE html>
 
     <div>
       <h1 class="title">Clock In / Out</h1>
-      <p class="sub">Enter your {{ min_len }}-{{ max_len }} digit PIN. The same PIN clocks you out.</p>
+      <p class="sub">Enter your {{ min_len }}-{{ max_len }} digit PIN, or scan your ID card. The same PIN or card clocks you out.</p>
     </div>
 
-    <div class="banner" id="banner"></div>
+    <div class="scan-hint" id="scanHint">
+      <svg width="34" height="22" viewBox="0 0 34 22" aria-hidden="true">
+        <g fill="currentColor">
+          <rect x="0" y="0" width="2" height="22"/><rect x="4" y="0" width="1" height="22"/>
+          <rect x="7" y="0" width="3" height="22"/><rect x="12" y="0" width="1" height="22"/>
+          <rect x="15" y="0" width="2" height="22"/><rect x="19" y="0" width="1" height="22"/>
+          <rect x="22" y="0" width="3" height="22"/><rect x="27" y="0" width="1" height="22"/>
+          <rect x="30" y="0" width="2" height="22"/><rect x="33" y="0" width="1" height="22"/>
+        </g>
+      </svg>
+      <span id="scanHintText">Have your school ID? Just scan it, any time.</span>
+    </div>
 
+    <!-- nfctag.py draws the NFC status bar here -->
+    <div id="nfcMount"></div>
+
+    <div class="banner" id="banner"></div>
+   </div>
+
+   <div class="col-pad">
     <div class="field">
       <div class="field-label">PIN</div>
       <div class="field-value">
@@ -613,7 +803,9 @@ KIOSK_HTML = """<!DOCTYPE html>
       <button class="btn" id="btnClear">Clear</button>
       <button class="btn primary" id="btnEnter" disabled>Enter</button>
     </div>
+   </div>
 
+   <div class="col-alt">
     <div class="divider">or</div>
 
     <button class="google-btn" id="btnGoogle">
@@ -622,6 +814,8 @@ KIOSK_HTML = """<!DOCTYPE html>
     {% if google_stubbed %}
     <p class="g-note">Demo account picker — real Google OAuth not wired up yet.</p>
     {% endif %}
+    <a class="admin-link" href="/admin">Admin</a>
+   </div>
   </div>
 </div>
 
@@ -707,7 +901,7 @@ const RESET_AFTER_MS = 4000;
 const $ = id => document.getElementById(id);
 
 const el = {
-  entry: $("entry"), banner: $("banner"), overlay: $("overlay"),
+  entry: $("entry"), banner: $("banner"), overlay: $("overlay"), scanHint: $("scanHint"),
   pinDots: $("pinDots"), numpad: $("numpad"),
   btnEnter: $("btnEnter"), btnClear: $("btnClear"), btnGoogle: $("btnGoogle"),
   clock: $("clock"),
@@ -1011,6 +1205,10 @@ async function saveLink() {
 
 /* ---------- confirmation ---------- */
 
+// One timer for the whole kiosk: when the next person in line scans while
+// this screen is still up, their result replaces it and gets the full time.
+let resetTimer = null;
+
 function showConfirmation(data) {
   const clockedOut = data.action === "clocked out";
 
@@ -1018,20 +1216,83 @@ function showConfirmation(data) {
   el.confirmAction.textContent = data.action;
   el.confirmTime.textContent = data.time;
   el.confirmIcon.innerHTML = clockedOut ? "&#8594;" : "&#10003;";
-  el.confirmNote.textContent = clockedOut
-    ? "You're clocked out. See you next shift."
-    : "You're clocked in. Have a good shift.";
+  if (data.repeat) {
+    el.confirmNote.textContent = "Already recorded a moment ago. Nothing changed.";
+  } else {
+    el.confirmNote.textContent = clockedOut
+      ? "You're clocked out. See you next shift."
+      : "You're clocked in. Have a good shift.";
+  }
   el.confirmPopup.classList.toggle("out", clockedOut);
 
+  hideBanner(el.banner);
   openPopup("confirmPopup");
 
-  setTimeout(() => {
+  clearTimeout(resetTimer);
+  resetTimer = setTimeout(() => {
     closePopup();
     state.pendingPin = null;
     state.pendingEmail = null;
     clearPin();
   }, RESET_AFTER_MS);
 }
+
+/* ---------- ID card scans ---------- */
+
+// Every scan, from any source, comes through here. A camera scanner added
+// later just calls handleScan(code, "camera") with what it decoded.
+// A PIN setup, Google link or "is this you?" popup belongs to whoever is
+// using the kiosk right now; a card scan or NFC tap shouldn't clock someone
+// else in underneath it. The result screen is fine to replace: that's just
+// the next person in line.
+function kioskBusy() {
+  return el.overlay.classList.contains("show") && el.confirmPopup.hidden;
+}
+
+// Shows what the server said about a card scan or NFC tap (nfctag.py uses
+// this too): the in/out result screen, or the red banner on failure.
+function showScanResult(data) {
+  // Any half-typed PIN belonged to no one; the card or tag decides who this is.
+  state.pin = "";
+  renderPin();
+
+  if (!data.ok) {
+    clearTimeout(resetTimer);
+    closePopup();
+    showBanner(el.banner, el.entry, data.message);
+    return;
+  }
+
+  showConfirmation(data);
+}
+
+async function handleScan(code, source) {
+  if (kioskBusy()) {
+    logEvent("scan_ignored", { source, reason: "popup open" });
+    return;
+  }
+
+  flashScanHint();
+
+  let data;
+  try {
+    data = await post("/api/badge/scan", { badge: code, source });
+  } catch (err) {
+    showBanner(el.banner, el.entry, "Kiosk is offline. Tell your site lead.");
+    return;
+  }
+
+  showScanResult(data);
+}
+
+function flashScanHint() {
+  el.scanHint.classList.add("hit");
+  setTimeout(() => el.scanHint.classList.remove("hit"), 700);
+}
+
+// For trying the scan flow with no scanner attached: open the browser's
+// developer console on the kiosk page and run  simulateScan("100234")
+window.simulateScan = code => handleScan(String(code), "simulated");
 
 /* ---------- clock ---------- */
 
@@ -1076,19 +1337,68 @@ el.setupCancel.addEventListener("click", () => { closePopup(); clearPin(); });
 el.googleCancel.addEventListener("click", () => { closePopup(); state.pendingEmail = null; });
 el.linkCancel.addEventListener("click", () => { closePopup(); state.pendingEmail = null; clearPin(); });
 
-// A physical keyboard also works, handy while developing on a laptop.
+/* ---------- barcode scanner + physical keyboard ---------- */
+
+// A USB/Bluetooth scanner is a keyboard that types the barcode very fast,
+// then presses Enter (some are set to press Tab). Keys are held back for a
+// moment before being treated as typing: if Enter arrives while they're
+// still pouring in, the whole burst was a scan.
+const SCAN_MAX_GAP_MS = 80;     // scanners: ~5-30ms per character; people: 100ms+
+const SCAN_MIN_LENGTH = 4;      // anything shorter is treated as typing
+const SCAN_TERMINATORS = ["Enter", "Tab"];
+
+let keyBuffer = [];
+let flushTimer = null;
+
+// Typing a PIN on a physical keyboard is a development convenience only;
+// on the tablet people use the on-screen numpad.
+function applyTypedKey(key) {
+  if (el.overlay.classList.contains("show")) return;
+  if (key === "Backspace") backspacePin();
+  else if (key === "Enter") submitPin();
+  else if (/^[0-9]$/.test(key)) pressPin(key);
+}
+
+function flushAsTyping() {
+  const keys = keyBuffer;
+  keyBuffer = [];
+  flushTimer = null;
+  keys.forEach(applyTypedKey);
+}
+
 window.addEventListener("keydown", e => {
-  if (!el.overlay.classList.contains("show")) {
-    if (e.key === "Backspace") { e.preventDefault(); backspacePin(); }
-    else if (e.key === "Enter") submitPin();
-    else if (/^[0-9]$/.test(e.key)) pressPin(e.key);
+  const isChar = e.key.length === 1;
+  const isTerminator = SCAN_TERMINATORS.includes(e.key);
+  if (e.repeat) return;                                            // a held-down key, never a scanner
+  if (!isChar && !isTerminator && e.key !== "Backspace") return;   // Shift and friends
+  e.preventDefault();
+  clearTimeout(flushTimer);
+
+  const looksLikeScan = isTerminator
+    && keyBuffer.length >= SCAN_MIN_LENGTH
+    && keyBuffer.every(k => k.length === 1);
+
+  if (looksLikeScan) {
+    const code = keyBuffer.join("");
+    keyBuffer = [];
+    handleScan(code, "scanner");
+    return;
   }
+
+  if (e.key === "Tab") {           // a Tab on its own means nothing here
+    flushAsTyping();
+    return;
+  }
+
+  keyBuffer.push(e.key);
+  flushTimer = setTimeout(flushAsTyping, SCAN_MAX_GAP_MS);
 });
 
 renderPin();
 tickClock();
 setInterval(tickClock, 1000);
 </script>
+<script src="/nfc/nfc.js"></script>
 </body>
 </html>
 """
@@ -1211,9 +1521,57 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .empty-row { text-align: center; color: var(--muted); padding: 34px; font-size: 15px; }
   tr.hidden { display: none; }
 
+  /* one-line result after linking or unlinking a card */
+  .notice { border-radius: 12px; padding: 12px 16px; font-size: 15px; font-weight: 600; }
+  .notice.ok { background: rgba(62,207,142,.12); color: var(--ok); border: 1px solid rgba(62,207,142,.4); }
+  .notice.error { background: rgba(255,107,107,.12); color: var(--err); border: 1px solid rgba(255,107,107,.4); }
+
+  /* ---------- link a school ID card ---------- */
+  .card-link {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 14px 16px;
+  }
+  .card-link-text { flex: 1 1 260px; }
+  .card-link-title { font-size: 15px; font-weight: 600; margin-bottom: 2px; }
+  .card-link input[type="text"] { width: 190px; }
+  .card-link button {
+    background: var(--accent);
+    border: 1px solid var(--accent);
+    color: #fff;
+    border-radius: 10px;
+    padding: 11px 16px;
+    font-size: 15px;
+    font-weight: 600;
+    font-family: inherit;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .badge-cell { white-space: nowrap; }
+  .inline { display: inline; }
+  .unlink {
+    background: none;
+    border: 1px solid var(--line);
+    color: var(--muted);
+    border-radius: 6px;
+    padding: 3px 8px;
+    margin-left: 8px;
+    font-size: 12px;
+    font-family: inherit;
+    cursor: pointer;
+  }
+  .unlink:hover { color: var(--err); border-color: rgba(255,107,107,.5); }
+
   @media (max-width: 760px) {
     body { padding: 14px; }
-    th:nth-child(5), td:nth-child(5) { display: none; }   /* hide Google column */
+    /* hide the Google and ID card columns */
+    th:nth-child(5), td:nth-child(5), th:nth-child(6), td:nth-child(6) { display: none; }
   }
 </style>
 </head>
@@ -1227,6 +1585,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
     <p class="sub">{{ today }}</p>
   </div>
+
+  {% if notice %}
+  <div class="notice {{ 'error' if notice_kind == 'error' else 'ok' }}">{{ notice }}</div>
+  {% endif %}
 
   {% if new_pin %}
   <div class="pin-callout">
@@ -1246,7 +1608,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 
   <div class="controls">
-    <input type="search" id="search" placeholder="Search by name or PIN…" autocomplete="off">
+    <input type="search" id="search" placeholder="Search by name, PIN or card…" autocomplete="off">
     <select id="statusFilter">
       <option value="all">All statuses</option>
       <option value="in">On shift</option>
@@ -1259,16 +1621,34 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </form>
   </div>
 
+  {% if punches %}
+  <form class="card-link" method="post" action="/badge/link">
+    <div class="card-link-text">
+      <div class="card-link-title">Link a school ID card</div>
+      <p class="sub">Pick the employee, then scan their card. The scanner presses Enter for you.</p>
+    </div>
+    <select name="pin" id="linkPin" required>
+      <option value="" disabled selected>Employee…</option>
+      {% for p in punches %}
+      <option value="{{ p.id }}">{{ p.name }}{% if p.badge %} (replace card){% endif %}</option>
+      {% endfor %}
+    </select>
+    <input type="text" name="badge" id="linkBadge" placeholder="Scan card here" autocomplete="off" required>
+    <button type="submit">Link card</button>
+  </form>
+  {{ nfc_panel }}
+  {% endif %}
+
   <div class="panel">
     <table>
       <thead>
         <tr>
-          <th>Employee</th><th>PIN</th><th>Status</th><th>Last punch</th><th>Google</th><th>Method</th>
+          <th>Employee</th><th>PIN</th><th>Status</th><th>Last punch</th><th>Google</th><th>ID card</th><th>Method</th>
         </tr>
       </thead>
       <tbody id="rows">
         {% for p in punches %}
-        <tr data-name="{{ p.name|lower }}" data-id="{{ p.id }}"
+        <tr data-name="{{ p.name|lower }}" data-id="{{ p.id }}" data-badge="{{ p.badge|lower }}"
             data-status="{{ 'pending' if p.temporary else p.status }}">
           <td class="name">{{ p.name }}</td>
           <td class="mono">{{ p.id }}</td>
@@ -1283,11 +1663,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </td>
           <td class="mono">{{ p.time }}</td>
           <td class="google-cell">{{ p.google or '—' }}</td>
+          <td class="badge-cell">
+            {% if p.badge %}
+              <span class="mono">{{ p.badge }}</span>
+              <form class="inline" method="post" action="/badge/unlink">
+                <input type="hidden" name="pin" value="{{ p.id }}">
+                <button class="unlink" type="submit" title="Remove this card, e.g. if it's lost">Unlink</button>
+              </form>
+            {% else %}
+              <span class="mono">—</span>
+            {% endif %}
+          </td>
           <td><span class="tag">{{ p.method }}</span></td>
         </tr>
         {% endfor %}
         <tr id="emptyRow" class="{% if punches %}hidden{% endif %}">
-          <td class="empty-row" colspan="6">
+          <td class="empty-row" colspan="7">
             {% if punches %}No employees match that search.
             {% else %}Nobody registered yet — add someone above.{% endif %}
           </td>
@@ -1310,7 +1701,10 @@ function applyFilters() {
   let shown = 0;
 
   dataRows.forEach(row => {
-    const matchesText = !q || row.dataset.name.includes(q) || row.dataset.id.includes(q);
+    const matchesText = !q
+      || row.dataset.name.includes(q)
+      || row.dataset.id.includes(q)
+      || row.dataset.badge.includes(q);
     const matchesStatus = status === "all" || row.dataset.status === status;
     const visible = matchesText && matchesStatus;
 
@@ -1323,7 +1717,15 @@ function applyFilters() {
 
 searchEl.addEventListener("input", applyFilters);
 filterEl.addEventListener("change", applyFilters);
+
+// Picking an employee leaves focus on the dropdown, where a scanner's
+// keystrokes would type-ahead and jump the selection to another name.
+// Move straight to the card box so the scan lands there.
+const linkPin = document.getElementById("linkPin");
+const linkBadge = document.getElementById("linkBadge");
+if (linkPin) linkPin.addEventListener("change", () => linkBadge.focus());
 </script>
+<script src="/nfc/nfc.js"></script>
 </body>
 </html>
 """
@@ -1336,4 +1738,8 @@ if __name__ == "__main__":
         seed_demo_staff()
 
     # host="0.0.0.0" so the Android tablet on the same network can reach it.
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # Web NFC on the tablet needs https. KIOSK_HTTPS=1 python app.py serves
+    # over https with a throwaway self-signed certificate (needs the
+    # "cryptography" package); the tablet shows a warning to accept once.
+    ssl = "adhoc" if os.environ.get("KIOSK_HTTPS") == "1" else None
+    app.run(host="0.0.0.0", port=5000, debug=True, ssl_context=ssl)
