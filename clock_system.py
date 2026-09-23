@@ -30,6 +30,11 @@ RETURNING employee
     for their PIN once to link the account (link_google_account); after
     that, find_by_google_email() finds them with no PIN at all.
 
+    Or they scan their existing school ID card. The employer links each
+    card's barcode to an employee once (link_badge); after that,
+    find_by_badge() identifies them and the scan flips the lever
+    straight away, with no confirm step.
+
 NEW employee
     Is handed a randomly produced temporary code. Entering it returns
     NEEDS_PIN_SETUP, and the interface prompts them to choose their own
@@ -58,6 +63,12 @@ PIN_TAKEN = "that pin is already taken"
 PIN_BAD_FORMAT = "pin must be 4-6 digits"
 GOOGLE_LINKED = "google account linked"
 GOOGLE_ALREADY_LINKED = "that google account is already linked to someone else"
+BADGE_LINKED = "badge linked"
+BADGE_UNLINKED = "badge unlinked"
+BADGE_ALREADY_LINKED = "that badge is already linked to someone else"
+BADGE_BAD_FORMAT = "badge value is empty or too long"
+
+MAX_BADGE_LENGTH = 64  # school ID barcodes are short; this only rejects junk
 
 
 def randomcode():
@@ -82,6 +93,7 @@ employee_records: Dict[str, Dict] = {}
 #       "status": "clocked_out",
 #       "temporary": True,        # still the issued code, not self-chosen
 #       "google_email": None,
+#       "badge": None,            # barcode value from their school ID card
 #   }
 
 
@@ -161,6 +173,7 @@ def register_employee(name: str) -> str:
         "status": "clocked_out",
         "temporary": True,
         "google_email": None,
+        "badge": None,
     }
     return new_pin
 
@@ -305,6 +318,72 @@ def link_google_account(pin: str, email: str) -> str:
 
 
 # ---------------------------------------------------------------------
+# 8. School ID cards: link a card's barcode once, then scan to clock
+# ---------------------------------------------------------------------
+def normalize_badge(value) -> str:
+    """Tidy a scanned or typed barcode value so the same card always matches.
+
+    Scanners differ in what they send around the barcode itself: some add
+    whitespace, and Code 39 scanners can be set to transmit the "*" start
+    and stop characters. Letters are uppercased because Code 39 cards are
+    case-insensitive but a typed value might not be.
+    """
+    return str(value or "").strip().strip("*").strip().upper()
+
+
+def find_by_badge(badge: str) -> Optional[str]:
+    """Returns the PIN whose record is linked to this card, or None."""
+    badge = normalize_badge(badge)
+    if not badge:
+        return None
+
+    for pin, record in employee_records.items():
+        if record.get("badge") == badge:
+            return pin
+    return None
+
+
+def link_badge(pin: str, badge: str) -> str:
+    """
+    Ties a school ID card's barcode to an employee. The employer does this
+    once per card, from the dashboard.
+
+    Returns one of:
+        "Does not exist"                    -> no employee has that PIN
+        "badge value is empty or too long"  -> nothing usable was scanned
+        "that badge is already linked to someone else"
+        "badge linked"                      -> done; replaces any card
+                                               this employee had before
+    """
+    pin = clean_pin(pin)
+    record = employee_records.get(pin)
+    badge = normalize_badge(badge)
+
+    if record is None:
+        return DOES_NOT_EXIST
+
+    if not badge or len(badge) > MAX_BADGE_LENGTH:
+        return BADGE_BAD_FORMAT
+
+    existing = find_by_badge(badge)
+    if existing is not None and existing != pin:
+        return BADGE_ALREADY_LINKED
+
+    record["badge"] = badge
+    return BADGE_LINKED
+
+
+def unlink_badge(pin: str) -> str:
+    """Removes an employee's card, e.g. when it's lost or replaced."""
+    record = employee_records.get(clean_pin(pin))
+    if record is None:
+        return DOES_NOT_EXIST
+
+    record["badge"] = None
+    return BADGE_UNLINKED
+
+
+# ---------------------------------------------------------------------
 # Demo / manual test only - remove this block in production.
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
@@ -327,6 +406,13 @@ if __name__ == "__main__":
     # Google: link once, then find with no PIN.
     print(link_google_account("246810", "jane@school.org"))  # -> "google account linked"
     print(find_by_google_email("jane@school.org"))           # -> "246810"
+
+    # School ID card: link once, then a scan finds her and flips the lever.
+    print(link_badge("246810", " *100234* "))     # -> "badge linked" (stored as "100234")
+    print(link_badge(taken, "100234"))            # -> "that badge is already linked to someone else"
+    scanned = find_by_badge("100234")
+    print(scanned)                                # -> "246810"
+    print(process_clock_entry(scanned))           # -> "clocked in"
 
     # "0000" is never handed out, so it's always a safe "unknown PIN" case.
     print(process_clock_entry("0000"))            # -> "Does not exist"
