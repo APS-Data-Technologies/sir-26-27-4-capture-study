@@ -195,6 +195,7 @@ def kiosk():
 
 
 @app.route("/dashboard")
+@app.route("/admin")
 def dashboard():
     punches = load_punches()
     counts = {
@@ -469,7 +470,8 @@ KIOSK_HTML = """<!DOCTYPE html>
 <title>Clock In / Out — Kiosk</title>
 <style>
 """ + BASE_CSS + """
-  html, body { height: 100%; overflow: hidden; user-select: none; }
+  html, body { height: 100%; user-select: none; }
+  body { overflow: auto; }
 
   .screen { height: 100%; display: flex; align-items: center; justify-content: center; padding: 20px; }
   .card {
@@ -706,6 +708,34 @@ KIOSK_HTML = """<!DOCTYPE html>
   }
   .confirm-time { font-size: 19px; color: var(--muted); font-variant-numeric: tabular-nums; }
 
+  /* ---------- fit the screen ---------- */
+  .screen { min-height: 100%; height: auto; padding: clamp(10px, 2.5vh, 20px); }
+  .card { gap: clamp(8px, 1.8vh, 18px); padding: clamp(14px, 2.6vh, 24px); }
+  .col-info, .col-pad, .col-alt { display: flex; flex-direction: column; gap: inherit; }
+  .key { min-height: clamp(44px, 7.5vh, 66px); }
+  .btn { min-height: clamp(44px, 6.5vh, 60px); }
+  .field { min-height: clamp(56px, 8.5vh, 82px); }
+  .google-btn { min-height: clamp(44px, 6vh, 58px); }
+  .admin-link { align-self: center; font-size: 12px; color: var(--muted); text-decoration: none; opacity: .7; }
+  .admin-link:hover { opacity: 1; text-decoration: underline; }
+
+  /* Landscape (laptop, tablet on its side): info + Google on the left,
+     PIN pad on the right, so nothing has to stack past the screen edge. */
+  @media (orientation: landscape) and (min-width: 820px) {
+    .card {
+      width: min(980px, 100%);
+      display: grid;
+      grid-template-columns: 1fr 1.1fr;
+      grid-template-areas: "info pad" "alt pad";
+      grid-template-rows: auto 1fr;
+      column-gap: clamp(20px, 3vw, 36px);
+    }
+    .col-info { grid-area: info; }
+    .col-pad  { grid-area: pad; justify-content: center; }
+    .col-alt  { grid-area: alt; justify-content: flex-end; }
+    .key { min-height: clamp(44px, 11vh, 76px); }
+  }
+
   @media (max-height: 680px) {
     .key { min-height: 52px; font-size: 22px; }
     .field { min-height: 68px; }
@@ -717,6 +747,7 @@ KIOSK_HTML = """<!DOCTYPE html>
 
 <div class="screen">
   <div class="card" id="entry">
+   <div class="col-info">
     <div class="head">
       <span class="site">{{ site }}</span>
       <span class="clock" id="clock">--:--</span>
@@ -741,7 +772,9 @@ KIOSK_HTML = """<!DOCTYPE html>
     </div>
 
     <div class="banner" id="banner"></div>
+   </div>
 
+   <div class="col-pad">
     <div class="field">
       <div class="field-label">PIN</div>
       <div class="field-value">
@@ -756,7 +789,9 @@ KIOSK_HTML = """<!DOCTYPE html>
       <button class="btn" id="btnClear">Clear</button>
       <button class="btn primary" id="btnEnter" disabled>Enter</button>
     </div>
+   </div>
 
+   <div class="col-alt">
     <div class="divider">or</div>
 
     <button class="google-btn" id="btnGoogle">
@@ -765,6 +800,8 @@ KIOSK_HTML = """<!DOCTYPE html>
     {% if google_stubbed %}
     <p class="g-note">Demo account picker — real Google OAuth not wired up yet.</p>
     {% endif %}
+    <a class="admin-link" href="/admin">Admin</a>
+   </div>
   </div>
 </div>
 
