@@ -156,7 +156,7 @@ SITE_LABEL = "Main Office"
 
 def record_punch(pin, method):
     """Note the time and capture method for the dashboard's last-punch column."""
-    last_punch[pin] = {"time": datetime.now().strftime("%-I:%M %p"), "method": method}
+    last_punch[pin] = {"time": datetime.now().strftime("%I:%M %p").lstrip("0"), "method": method}
 
 
 # What the kiosk says when clock_system refuses to flip the lever.
@@ -176,7 +176,7 @@ def clock_response(pin, method):
             "ok": True,
             "name": cs.employee_records[cs.clean_pin(pin)]["name"],
             "action": result,
-            "time": datetime.now().strftime("%-I:%M:%S %p"),
+            "time": datetime.now().strftime("%I:%M:%S %p").lstrip("0"),
         }
 
     return {"ok": False, "message": CLOCK_FAILURE_MESSAGES.get(result, result)}
@@ -216,7 +216,7 @@ def dashboard():
         site=SITE_LABEL,
         punches=punches,
         counts=counts,
-        today=datetime.now().strftime("%A, %B %-d, %Y"),
+        today=f"{datetime.now():%A, %B} {datetime.now().day}, {datetime.now():%Y}",
         new_pin=request.args.get("pin"),
         new_name=request.args.get("name"),
         nfc_panel=nfctag.admin_panel(),
