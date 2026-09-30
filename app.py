@@ -24,7 +24,7 @@ RETURNING employee
     -> "No, try again" clears and returns to the numpad.
     Or they tap Sign in with Google and skip the PIN entirely.
     Or they scan their school ID card: that clocks them in or out at once.
-    Or they tap their NFC tag on the tablet (nfctag.py): same, instantly.
+    Or they tap the NFC wall tag with their own phone (nfctag.py).
 
 NEW employee
     types the temporary code they were issued -> popup asks them to
@@ -146,10 +146,6 @@ def seed_demo_staff():
 
     issued = cs.register_employee("New Hire")
     cs.link_badge(issued, "100999")
-
-    # Made-up NFC tag serial, for trying a tap without real tags.
-    nfctag.link_tag("1234", "04:A2:3B:1C:5D:80:00")
-    print("[seed] Sample Person -> demo NFC tag 04:A2:3B:1C:5D:80:00")
     print(f"[seed] New Hire -> temporary code {issued}, card 100999 "
           f"(will be asked to pick a PIN)")
 
@@ -222,7 +218,7 @@ def dashboard():
         today=datetime.now().strftime("%A, %B %-d, %Y"),
         new_pin=request.args.get("pin"),
         new_name=request.args.get("name"),
-        nfc_panel=nfctag.admin_panel(punches),
+        nfc_panel=nfctag.admin_panel(),
         notice=request.args.get("notice"),
         notice_kind=request.args.get("kind", "ok"),
     )
@@ -259,6 +255,45 @@ def badge_link():
         cs.BADGE_ALREADY_LINKED: "That card is already linked to someone else. Unlink it there first.",
     }
     return redirect(url_for("dashboard", notice=messages.get(result, result), kind="error"))
+
+
+@app.route("/admin/remove/<pin>", methods=["GET", "POST"])
+def remove_employee(pin):
+    """Removing someone frees their PIN. Deliberately slow to do by accident:
+    the dashboard only links here, and this page won't remove anyone until
+    the admin types the employee's full name and ticks a box. The name is
+    checked again here on the server, not just in the browser."""
+    pin = cs.clean_pin(pin)
+    record = cs.lookup(pin)
+    if record is None:
+        return redirect(url_for("dashboard", notice="That employee no longer exists.", kind="error"))
+
+    error = None
+    if request.method == "POST":
+        if request.form.get("understand") != "yes":
+            error = "Tick the box to confirm you understand this can't be undone."
+        else:
+            name = record["name"]
+            result = cs.remove_employee(pin, request.form.get("typed_name", ""))
+            if result == cs.EMPLOYEE_REMOVED:
+                # Clear everything else this app held for that PIN, so the
+                # next person to get it starts clean.
+                last_punch.pop(pin, None)
+                recent_scans.pop(pin, None)
+                nfctag.recent_taps.pop(pin, None)
+                phones = nfctag.forget_devices_for(pin)
+                log_event("employee_removed", {"pin": pin, "phones_forgotten": phones})
+                return redirect(url_for(
+                    "dashboard", kind="ok",
+                    notice=f"{name} was removed. PIN {pin} is free to use again.",
+                ))
+            error = "The name you typed doesn't match. Nothing was removed."
+        log_event("employee_remove_refused", {"pin": pin, "reason": error})
+
+    return render_template_string(
+        REMOVE_HTML, pin=pin, record=record, error=error,
+        phones=sum(1 for p in nfctag.remembered_devices.values() if p == pin),
+    )
 
 
 @app.route("/badge/unlink", methods=["POST"])
@@ -781,9 +816,6 @@ KIOSK_HTML = """<!DOCTYPE html>
       </svg>
       <span id="scanHintText">Have your school ID? Just scan it, any time.</span>
     </div>
-
-    <!-- nfctag.py draws the NFC status bar here -->
-    <div id="nfcMount"></div>
 
     <div class="banner" id="banner"></div>
    </div>
@@ -1398,7 +1430,6 @@ renderPin();
 tickClock();
 setInterval(tickClock, 1000);
 </script>
-<script src="/nfc/nfc.js"></script>
 </body>
 </html>
 """
@@ -1554,6 +1585,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
 
   .badge-cell { white-space: nowrap; }
+  /* deliberately quiet: it only opens the confirmation page */
+  .remove-link { font-size: 12px; color: var(--muted); text-decoration: none; opacity: .7; white-space: nowrap; }
+  .remove-link:hover { color: var(--err); opacity: 1; text-decoration: underline; }
   .inline { display: inline; }
   .unlink {
     background: none;
@@ -1643,7 +1677,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <table>
       <thead>
         <tr>
-          <th>Employee</th><th>PIN</th><th>Status</th><th>Last punch</th><th>Google</th><th>ID card</th><th>Method</th>
+          <th>Employee</th><th>PIN</th><th>Status</th><th>Last punch</th><th>Google</th><th>ID card</th><th>Method</th><th></th>
         </tr>
       </thead>
       <tbody id="rows">
@@ -1675,10 +1709,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             {% endif %}
           </td>
           <td><span class="tag">{{ p.method }}</span></td>
+          <td><a class="remove-link" href="/admin/remove/{{ p.id }}">Remove…</a></td>
         </tr>
         {% endfor %}
         <tr id="emptyRow" class="{% if punches %}hidden{% endif %}">
-          <td class="empty-row" colspan="7">
+          <td class="empty-row" colspan="8">
             {% if punches %}No employees match that search.
             {% else %}Nobody registered yet — add someone above.{% endif %}
           </td>
@@ -1725,7 +1760,101 @@ const linkPin = document.getElementById("linkPin");
 const linkBadge = document.getElementById("linkBadge");
 if (linkPin) linkPin.addEventListener("change", () => linkBadge.focus());
 </script>
-<script src="/nfc/nfc.js"></script>
+</body>
+</html>
+"""
+
+
+# =====================================================================
+# REMOVE-EMPLOYEE CONFIRMATION PAGE
+# =====================================================================
+
+REMOVE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Remove employee</title>
+<style>
+""" + BASE_CSS + """
+  body { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+  .card { width: min(520px, 100%); background: var(--card); border: 1px solid rgba(255,107,107,.45);
+    border-radius: 18px; padding: 24px; display: flex; flex-direction: column; gap: 16px; }
+  h1 { margin: 0; font-size: 22px; color: var(--err); }
+  .who { font-size: 26px; font-weight: 700; }
+  ul { margin: 0; padding-left: 20px; color: var(--muted); font-size: 14px; line-height: 1.6; }
+  .warn { background: rgba(245,196,81,.12); color: var(--warn); border: 1px solid rgba(245,196,81,.4);
+    border-radius: 12px; padding: 10px 14px; font-size: 14px; font-weight: 600; }
+  .error { background: rgba(255,107,107,.12); color: var(--err); border: 1px solid rgba(255,107,107,.4);
+    border-radius: 12px; padding: 10px 14px; font-size: 14px; font-weight: 600; }
+  label { font-size: 14px; color: var(--muted); display: flex; flex-direction: column; gap: 6px; }
+  input[type="text"] { background: var(--field); border: 1px solid var(--line); color: var(--text);
+    border-radius: 10px; padding: 12px 14px; font-size: 16px; font-family: inherit; }
+  input[type="text"]:focus { outline: none; border-color: var(--err); }
+  .check { flex-direction: row; align-items: center; gap: 10px; }
+  .check input { width: 20px; height: 20px; }
+  .actions { display: flex; gap: 10px; }
+  .actions > * { flex: 1; min-height: 50px; border-radius: 10px; font: inherit; font-size: 15px;
+    font-weight: 600; cursor: pointer; display: flex; align-items: center; justify-content: center; text-decoration: none; }
+  .back { background: var(--accent); border: 1px solid var(--accent); color: #fff; }
+  .danger { background: transparent; border: 1px solid var(--err); color: var(--err); }
+  .danger:disabled { opacity: .35; cursor: not-allowed; }
+  .danger:not(:disabled):hover { background: var(--err); color: #fff; }
+</style>
+</head>
+<body>
+  <form class="card" method="post" autocomplete="off">
+    <h1>Remove employee</h1>
+    <div class="who">{{ record.name }}</div>
+
+    <ul>
+      <li>Their record is deleted and PIN <b>{{ pin }}</b> becomes free for someone else.</li>
+      {% set linked = [] %}
+      {% if record.badge %}{% set _ = linked.append("ID card") %}{% endif %}
+      {% if record.google_email %}{% set _ = linked.append("Google account") %}{% endif %}
+      {% if phones %}{% set _ = linked.append(phones ~ " remembered phone" ~ ("s" if phones != 1 else "")) %}{% endif %}
+      {% if linked %}
+      <li>Their linked {{ linked[:-1]|join(", ") ~ (" and " if linked|length > 1 else "") ~ linked[-1] }}
+          will stop working.</li>
+      {% endif %}
+      <li><b>This can't be undone.</b> To bring them back you'd register them again.</li>
+    </ul>
+
+    {% if record.status == "clocked_in" %}
+    <div class="warn">{{ record.name }} is currently clocked in. Removing them ends that shift with no clock-out.</div>
+    {% endif %}
+
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+    <label>Type their full name to confirm: <b style="color:var(--text)">{{ record.name }}</b>
+      <input type="text" name="typed_name" id="typedName" spellcheck="false" autofocus>
+    </label>
+
+    <label class="check">
+      <input type="checkbox" name="understand" value="yes" id="understand">
+      I understand this permanently removes {{ record.name }}.
+    </label>
+
+    <div class="actions">
+      <a class="back" href="/admin">Cancel, keep them</a>
+      <button class="danger" type="submit" id="removeBtn" disabled>Remove permanently</button>
+    </div>
+  </form>
+
+<script>
+// The button only wakes up once the typed name matches and the box is
+// ticked. The server checks the name again, so this is a convenience only.
+const expected = {{ record.name|tojson }};
+const tidy = s => s.trim().split(/\\s+/).join(" ").toLowerCase();
+const typed = document.getElementById("typedName");
+const box = document.getElementById("understand");
+const btn = document.getElementById("removeBtn");
+function update() { btn.disabled = !(box.checked && tidy(typed.value) === tidy(expected)); }
+typed.addEventListener("input", update);
+box.addEventListener("change", update);
+// No pasting: the name has to be typed on purpose.
+typed.addEventListener("paste", e => e.preventDefault());
+</script>
 </body>
 </html>
 """
