@@ -67,6 +67,8 @@ BADGE_LINKED = "badge linked"
 BADGE_UNLINKED = "badge unlinked"
 BADGE_ALREADY_LINKED = "that badge is already linked to someone else"
 BADGE_BAD_FORMAT = "badge value is empty or too long"
+EMPLOYEE_REMOVED = "employee removed"
+NAME_MISMATCH = "typed name does not match"
 
 MAX_BADGE_LENGTH = 64  # school ID barcodes are short; this only rejects junk
 
@@ -381,6 +383,40 @@ def unlink_badge(pin: str) -> str:
 
     record["badge"] = None
     return BADGE_UNLINKED
+
+
+# ---------------------------------------------------------------------
+# 9. Remove an employee, freeing their PIN for someone else
+# ---------------------------------------------------------------------
+def same_name(a: str, b: str) -> bool:
+    """Case- and spacing-insensitive name comparison."""
+    tidy = lambda s: " ".join((s or "").split()).casefold()
+    return tidy(a) == tidy(b)
+
+
+def remove_employee(pin: str, typed_name: str) -> str:
+    """
+    Deletes an employee's record. Their PIN, ID card and Google link all go
+    with it, so the PIN can be chosen or issued again.
+
+    As a guard against removing the wrong person, the caller must pass the
+    employee's full name exactly as it's on file (case and spacing aside).
+
+    Returns one of:
+        "Does not exist"             -> no employee has that PIN
+        "typed name does not match"  -> nothing was removed
+        "employee removed"
+    """
+    pin = clean_pin(pin)
+    record = employee_records.get(pin)
+
+    if record is None:
+        return DOES_NOT_EXIST
+    if not same_name(record["name"], typed_name):
+        return NAME_MISMATCH
+
+    del employee_records[pin]
+    return EMPLOYEE_REMOVED
 
 
 # ---------------------------------------------------------------------
