@@ -263,6 +263,13 @@ PHONE_HTML = """<!DOCTYPE html>
   .overlay { position: fixed; inset: 0; background: rgba(7,10,17,.8); display: flex;
     align-items: center; justify-content: center; padding: 16px; animation: fade .15s ease-out; }
   .popup { animation: rise .2s ease-out; }
+  [hidden] { display: none !important; }
+  .nfc-waves { position: relative; width: 90px; height: 90px; margin: 4px auto; }
+  .nfc-waves span { position: absolute; inset: 0; border: 3px solid var(--accent); border-radius: 50%;
+    animation: ripple 1.8s ease-out infinite; opacity: 0; }
+  .nfc-waves span:nth-child(2) { animation-delay: .6s; }
+  .nfc-waves span:nth-child(3) { animation-delay: 1.2s; }
+  @keyframes ripple { from { transform: scale(.3); opacity: 1; } to { transform: scale(1); opacity: 0; } }
   @keyframes fade { from { opacity: 0; } }
   @keyframes rise { from { transform: translateY(14px); opacity: 0; } }
 </style>
@@ -290,6 +297,7 @@ PHONE_HTML = """<!DOCTYPE html>
       <p class="sub">See you next shift.</p>
     {% endif %}
 
+    <button class="btn primary" type="button" onclick="openScan()">Scan NFC tag</button>
     <p class="sub">To clock {{ 'out' if on_shift else 'in' }}, tap the tag again.</p>
 
     <form method="post" action="/tap/forget">
@@ -324,6 +332,74 @@ PHONE_HTML = """<!DOCTYPE html>
     setTimeout(closePopup, 5000);
   </script>
   {% endif %}
+
+  <!-- "Scan NFC tag" pop-up -->
+  <div class="overlay" id="scanPopup" hidden>
+    <div class="card popup">
+      <div class="nfc-waves" aria-hidden="true"><span></span><span></span><span></span></div>
+      <h1>Scan NFC</h1>
+      <p class="sub" id="scanHelp">Hold the top of your phone near the clock-in tag.</p>
+      <div class="error" id="scanError" hidden></div>
+      <button class="btn ghost" type="button" onclick="closeScan()">Cancel</button>
+    </div>
+  </div>
+  <script>
+    // iPhones: Safari can't read NFC from a web page, but an unlocked iPhone
+    // reads the tag by itself and opens its link, so the pop-up just says
+    // where to hold it. Android Chrome: Web NFC can start the scan right
+    // here (https only); when the tag is read we open its link, which
+    // clocks the person in or out exactly like a normal tap.
+    const isIPhone = /iPhone|iPad|iPod/.test(navigator.userAgent)
+      || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    let scanAbort = null;
+
+    function scanMessage(text, isError) {
+      document.getElementById("scanHelp").hidden = !!isError;
+      const err = document.getElementById("scanError");
+      err.hidden = !isError;
+      if (isError) err.textContent = text; else document.getElementById("scanHelp").textContent = text;
+    }
+
+    async function openScan() {
+      document.getElementById("scanPopup").hidden = false;
+      if (isIPhone) {
+        scanMessage("Hold the top of your iPhone near the tag. Keep the screen on and unlocked; " +
+                    "your iPhone reads it automatically.");
+        return;
+      }
+      if (!("NDEFReader" in window)) {
+        scanMessage("Hold the back of your phone near the tag. If nothing happens, check NFC is " +
+                    "turned on in your phone's settings.");
+        return;
+      }
+      scanMessage("Hold the back of your phone near the tag…");
+      try {
+        scanAbort = new AbortController();
+        const reader = new NDEFReader();
+        await reader.scan({ signal: scanAbort.signal });
+        reader.onreading = event => {
+          const decoder = new TextDecoder();
+          for (const record of event.message.records) {
+            if (record.recordType === "url" || record.recordType === "absolute-url") {
+              const url = decoder.decode(record.data);
+              if (url.includes("/tap?")) { closeScan(); location.href = url; return; }
+            }
+          }
+          scanMessage("That isn't the clock-in tag. Try again.", true);
+        };
+        reader.onreadingerror = () => scanMessage("Couldn't read the tag. Hold it still and try again.", true);
+      } catch (e) {
+        scanMessage(e.name === "NotAllowedError"
+          ? "NFC permission was blocked. Allow it in your browser's site settings."
+          : "Hold the back of your phone near the tag. (In-page scanning needs the https link.)", true);
+      }
+    }
+
+    function closeScan() {
+      if (scanAbort) { scanAbort.abort(); scanAbort = null; }
+      document.getElementById("scanPopup").hidden = true;
+    }
+  </script>
 
   {% if started_ms %}
   <script>
@@ -539,7 +615,7 @@ def create_blueprint(clock_response, log_event):
             view="status",
             name=record["name"],
             on_shift=on_shift,
-            started_label=datetime.fromtimestamp(started).strftime("%-I:%M %p") if started else None,
+            started_label=datetime.fromtimestamp(started).strftime("%I:%M %p").lstrip("0") if started else None,
             started_ms=int(started * 1000) if started else None,
             just=request.args.get("just"),
             at=request.args.get("at", ""),
