@@ -4,7 +4,7 @@ Clock-in kiosk prototype — UI layer.
 Two screens:
     /           employee kiosk (PIN entry, Google sign-in, ID card scan)
     /dashboard  employer view (summary tiles, staff table, registration,
-                linking school ID cards)
+                linking school ID cards, digital ID cards via digitalID.py)
 
 Run:
     pip install flask
@@ -56,6 +56,7 @@ from flask import (
 
 import clock_system as cs
 import nfctag
+import digitalID
 
 app = Flask(__name__)
 
@@ -219,6 +220,7 @@ def dashboard():
         new_pin=request.args.get("pin"),
         new_name=request.args.get("name"),
         nfc_panel=nfctag.admin_panel(),
+        digital_id_panel=digitalID.admin_panel(),
         notice=request.args.get("notice"),
         notice_kind=request.args.get("kind", "ok"),
     )
@@ -1586,6 +1588,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   .badge-cell { white-space: nowrap; }
   /* deliberately quiet: it only opens the confirmation page */
+  .row-links { white-space: nowrap; }
+  .id-link { font-size: 12px; color: var(--accent); text-decoration: none; margin-right: 10px; }
+  .id-link:hover { text-decoration: underline; }
   .remove-link { font-size: 12px; color: var(--muted); text-decoration: none; opacity: .7; white-space: nowrap; }
   .remove-link:hover { color: var(--err); opacity: 1; text-decoration: underline; }
   .inline { display: inline; }
@@ -1671,6 +1676,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <button type="submit">Link card</button>
   </form>
   {{ nfc_panel }}
+  {{ digital_id_panel }}
   {% endif %}
 
   <div class="panel">
@@ -1709,7 +1715,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             {% endif %}
           </td>
           <td><span class="tag">{{ p.method }}</span></td>
-          <td><a class="remove-link" href="/admin/remove/{{ p.id }}">Remove…</a></td>
+          <td class="row-links"><a class="id-link" href="/digital-id/{{ p.id }}">Digital ID</a>
+              <a class="remove-link" href="/admin/remove/{{ p.id }}">Remove…</a></td>
         </tr>
         {% endfor %}
         <tr id="emptyRow" class="{% if punches %}hidden{% endif %}">
@@ -1858,6 +1865,11 @@ typed.addEventListener("paste", e => e.preventDefault());
 </body>
 </html>
 """
+
+
+# Digital ID cards live in their own module (digitalID.py). Registered here,
+# below BASE_CSS, because the ID page reuses the same styles.
+app.register_blueprint(digitalID.create_blueprint(log_event, BASE_CSS, SITE_LABEL))
 
 
 if __name__ == "__main__":
