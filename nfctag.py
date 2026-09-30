@@ -41,6 +41,7 @@ import os
 import secrets
 import socket
 import time
+from datetime import datetime
 
 from flask import Blueprint, jsonify, make_response, redirect, render_template_string, request, url_for
 from markupsafe import Markup
@@ -130,6 +131,11 @@ TAP_COOLDOWN_SECONDS = 10
 
 # PIN -> (time.monotonic() of the tap, the response it got)
 recent_taps = {}
+
+# PIN -> when their current shift started (wall-clock seconds), for the
+# phone's status page. Set on a phone clock-in; other methods leave it unset
+# and the page just doesn't show a timer.
+shift_started = {}
 
 
 def lan_base_url() -> str:
@@ -249,6 +255,16 @@ PHONE_HTML = """<!DOCTYPE html>
     color: var(--muted); font-size: 14px; }
   label.remember input { width: 20px; height: 20px; }
   a { color: var(--muted); font-size: 13px; }
+  .pill { align-self: center; padding: 6px 14px; border-radius: 999px; font-weight: 700;
+    font-size: 13px; letter-spacing: .05em; text-transform: uppercase; }
+  .pill.on { background: rgba(62,207,142,.14); color: var(--ok); }
+  .pill.off { background: rgba(147,160,181,.16); color: var(--muted); }
+  .timer { font-size: 40px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .overlay { position: fixed; inset: 0; background: rgba(7,10,17,.8); display: flex;
+    align-items: center; justify-content: center; padding: 16px; animation: fade .15s ease-out; }
+  .popup { animation: rise .2s ease-out; }
+  @keyframes fade { from { opacity: 0; } }
+  @keyframes rise { from { transform: translateY(14px); opacity: 0; } }
 </style>
 </head>
 <body>
@@ -259,6 +275,68 @@ PHONE_HTML = """<!DOCTYPE html>
     <h1>This tag's link is out of date</h1>
     <p class="sub">Ask your site lead to update the NFC tag.</p>
   </div>
+
+{% elif view == "status" %}
+  <div class="card">
+    <div class="who">{{ name }}</div>
+    <div class="pill {{ 'on' if on_shift else 'off' }}">{{ 'On shift' if on_shift else 'Clocked out' }}</div>
+
+    {% if on_shift and started_label %}
+      <p class="sub">Since {{ started_label }}</p>
+      <div class="timer" id="timer">0:00:00</div>
+    {% elif on_shift %}
+      <p class="sub">You're clocked in.</p>
+    {% else %}
+      <p class="sub">See you next shift.</p>
+    {% endif %}
+
+    <p class="sub">To clock {{ 'out' if on_shift else 'in' }}, tap the tag again.</p>
+
+    <form method="post" action="/tap/forget">
+      <input type="hidden" name="t" value="{{ token }}">
+      <button class="btn ghost" type="submit">Not you? Forget this phone</button>
+    </form>
+  </div>
+
+  {% if just %}
+  <!-- The result of the tap, as a pop-up over the status page -->
+  <div class="overlay" id="popup" onclick="closePopup()">
+    <div class="card popup {{ 'out' if was_out else '' }}">
+      <div class="icon">{{ '&#8594;'|safe if was_out else '&#10003;'|safe }}</div>
+      <div class="who">{{ name }}</div>
+      <div class="action">{{ 'clocked out' if was_out else 'clocked in' }}</div>
+      {% if at %}<div class="time">{{ at }}</div>{% endif %}
+      <p class="sub">
+        {% if just == "repeat" %}Already recorded a moment ago. Nothing changed.
+        {% elif was_out %}You're clocked out. See you next shift.
+        {% else %}You're clocked in. Have a good shift.{% endif %}
+      </p>
+      <button class="btn primary" type="button">OK</button>
+    </div>
+  </div>
+  <script>
+    function closePopup() {
+      const p = document.getElementById("popup");
+      if (p) p.remove();
+      // Drop the result from the address, so a reload doesn't show it again.
+      history.replaceState(null, "", location.pathname + "?t={{ token }}");
+    }
+    setTimeout(closePopup, 5000);
+  </script>
+  {% endif %}
+
+  {% if started_ms %}
+  <script>
+    const start = {{ started_ms }};
+    const el = document.getElementById("timer");
+    function tick() {
+      const s = Math.max(0, Math.floor((Date.now() - start) / 1000));
+      const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), sec = s % 60;
+      el.textContent = h + ":" + String(m).padStart(2, "0") + ":" + String(sec).padStart(2, "0");
+    }
+    tick(); setInterval(tick, 1000);
+  </script>
+  {% endif %}
 
 {% elif view == "result" %}
   <div class="card {{ 'out' if result.action == 'clocked out' else '' }}">
@@ -374,7 +452,15 @@ def create_blueprint(clock_response, log_event):
         log_event("nfc_tap", {"pin": pin, "result": response.get("action") or response.get("message")})
         if response["ok"]:
             recent_taps[pin] = (now, response)
+            if response["action"] == cs.CLOCKED_IN:
+                shift_started[pin] = time.time()
+            else:
+                shift_started.pop(pin, None)
         return response
+
+    def status_url(**extra):
+        from urllib.parse import urlencode
+        return "/tap/status?" + urlencode({"t": current_token(), **extra})
 
     @bp.route("/tap")
     def tap():
@@ -390,7 +476,8 @@ def create_blueprint(clock_response, log_event):
         response = clock(pin)
         if not response["ok"]:
             return page(view="pin", error=response["message"])
-        return page(view="result", result=response, remembered=True)
+        return redirect(status_url(just="repeat" if response.get("repeat") else response["action"],
+                                   at=response.get("time", "")))
 
     @bp.route("/tap/identify", methods=["POST"])
     def identify():
@@ -421,7 +508,11 @@ def create_blueprint(clock_response, log_event):
             return page(view="pin", error=response["message"])
 
         remember = request.form.get("remember") == "1"
-        resp = make_response(page(view="result", result=response, remembered=remember))
+        if remember:
+            just = "repeat" if response.get("repeat") else response["action"]
+            resp = redirect(status_url(just=just, at=response.get("time", "")))
+        else:
+            resp = make_response(page(view="result", result=response, remembered=False))
         if remember:
             resp.set_cookie(
                 DEVICE_COOKIE, remember_device(pin),
@@ -430,6 +521,31 @@ def create_blueprint(clock_response, log_event):
             )
             log_event("nfc_remember_phone", {"pin": pin})
         return resp
+
+    @bp.route("/tap/status")
+    def status():
+        """The page that stays up: on shift or not, since when, and a button
+        to clock the other way. Loading or reloading it changes nothing."""
+        if not token_ok():
+            return page(view="invalid"), 403
+        pin = device_pin(request.cookies.get(DEVICE_COOKIE))
+        if pin is None:
+            return page(view="pin")
+
+        record = cs.employee_records[pin]
+        on_shift = record["status"] == "clocked_in"
+        started = shift_started.get(pin) if on_shift else None
+        return page(
+            view="status",
+            name=record["name"],
+            on_shift=on_shift,
+            started_label=datetime.fromtimestamp(started).strftime("%-I:%M %p") if started else None,
+            started_ms=int(started * 1000) if started else None,
+            just=request.args.get("just"),
+            at=request.args.get("at", ""),
+            was_out=request.args.get("just") == "clocked out"
+                    or (request.args.get("just") == "repeat" and not on_shift),
+        )
 
     @bp.route("/tap/forget", methods=["POST"])
     def forget_this_phone():
