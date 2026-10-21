@@ -53,7 +53,12 @@ import clock_system as cs
 # ---------------------------------------------------------------------
 # Kept in a small file next to this module so the link on the tag survives
 # server restarts. Delete the file (or press "Make a new link") to replace it.
-TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nfc_site_token.txt")
+# NFC_DATA_DIR lets Docker keep this file in a volume, so rebuilding the
+# container doesn't wipe the code (and break the link on the tag).
+TOKEN_FILE = os.path.join(
+    os.environ.get("NFC_DATA_DIR") or os.path.dirname(os.path.abspath(__file__)),
+    "nfc_site_token.txt",
+)
 
 
 def _load_or_create_token() -> str:
@@ -98,11 +103,51 @@ DEVICE_COOKIE_DAYS = 365
 # device ID -> PIN
 remembered_devices = {}
 
+# device ID -> {"kind": "iPhone", "added": time.time()}, so the admin page
+# can tell one person's phones apart ("iPhone, remembered Oct 3") and
+# forget just the old one when someone switches phones.
+device_info = {}
 
-def remember_device(pin: str) -> str:
+
+def phone_kind(user_agent: str) -> str:
+    """A rough, human label for a phone from its browser's User-Agent."""
+    ua = user_agent or ""
+    for needle, label in (("iPhone", "iPhone"), ("iPad", "iPad"), ("Android", "Android phone")):
+        if needle in ua:
+            return label
+    return "Phone"
+
+
+def remember_device(pin: str, user_agent: str = "") -> str:
     device_id = secrets.token_urlsafe(24)
     remembered_devices[device_id] = cs.clean_pin(pin)
+    device_info[device_id] = {"kind": phone_kind(user_agent), "added": time.time()}
     return device_id
+
+
+def forget_device(device_id: str) -> bool:
+    """Forget one phone. Returns False if it wasn't remembered."""
+    device_info.pop(device_id or "", None)
+    return remembered_devices.pop(device_id or "", None) is not None
+
+
+def devices_for(pin: str):
+    """This employee's remembered phones, oldest first:
+    [{"id": ..., "kind": "iPhone", "added": 1696000000.0}, ...]"""
+    pin = cs.clean_pin(pin)
+    phones = [
+        {"id": d, **device_info.get(d, {"kind": "Phone", "added": 0})}
+        for d, p in remembered_devices.items() if p == pin
+    ]
+    return sorted(phones, key=lambda ph: ph["added"])
+
+
+def move_devices(old_pin: str, new_pin: str) -> None:
+    """Keep someone's phones working after their PIN changes."""
+    old_pin, new_pin = cs.clean_pin(old_pin), cs.clean_pin(new_pin)
+    for d, p in list(remembered_devices.items()):
+        if p == old_pin:
+            remembered_devices[d] = new_pin
 
 
 def device_pin(device_id):
@@ -117,25 +162,8 @@ def forget_devices_for(pin: str) -> int:
     pin = cs.clean_pin(pin)
     doomed = [d for d, p in remembered_devices.items() if p == pin]
     for d in doomed:
-        del remembered_devices[d]
+        forget_device(d)
     return len(doomed)
-
-
-# ---------------------------------------------------------------------
-# Double-tap guard
-# ---------------------------------------------------------------------
-# A tap clocks in or out instantly, and phones sometimes open the link twice
-# for one tap. Within this window a repeat just shows the earlier result
-# instead of clocking the person straight back out.
-TAP_COOLDOWN_SECONDS = 10
-
-# PIN -> (time.monotonic() of the tap, the response it got)
-recent_taps = {}
-
-# PIN -> when their current shift started (wall-clock seconds), for the
-# phone's status page. Set on a phone clock-in; other methods leave it unset
-# and the page just doesn't show a timer.
-shift_started = {}
 
 
 def lan_base_url() -> str:
@@ -143,7 +171,13 @@ def lan_base_url() -> str:
 
     The admin page is often opened as localhost, which a phone can't reach,
     so this finds the computer's own network address instead.
+
+    Set PUBLIC_URL (e.g. http://192.168.1.20:5000) to override it. That's
+    required under Docker, where the detected address is the container's
+    internal one, which phones can't reach.
     """
+    if os.environ.get("PUBLIC_URL"):
+        return os.environ["PUBLIC_URL"].rstrip("/")
     scheme = request.scheme
     port = request.host.rsplit(":", 1)[1] if ":" in request.host else ""
     try:
@@ -263,6 +297,13 @@ PHONE_HTML = """<!DOCTYPE html>
   .overlay { position: fixed; inset: 0; background: rgba(7,10,17,.8); display: flex;
     align-items: center; justify-content: center; padding: 16px; animation: fade .15s ease-out; }
   .popup { animation: rise .2s ease-out; }
+  [hidden] { display: none !important; }
+  .nfc-waves { position: relative; width: 90px; height: 90px; margin: 4px auto; }
+  .nfc-waves span { position: absolute; inset: 0; border: 3px solid var(--accent); border-radius: 50%;
+    animation: ripple 1.8s ease-out infinite; opacity: 0; }
+  .nfc-waves span:nth-child(2) { animation-delay: .6s; }
+  .nfc-waves span:nth-child(3) { animation-delay: 1.2s; }
+  @keyframes ripple { from { transform: scale(.3); opacity: 1; } to { transform: scale(1); opacity: 0; } }
   @keyframes fade { from { opacity: 0; } }
   @keyframes rise { from { transform: translateY(14px); opacity: 0; } }
 </style>
@@ -290,6 +331,7 @@ PHONE_HTML = """<!DOCTYPE html>
       <p class="sub">See you next shift.</p>
     {% endif %}
 
+    <button class="btn primary" type="button" onclick="openScan()">Scan NFC tag</button>
     <p class="sub">To clock {{ 'out' if on_shift else 'in' }}, tap the tag again.</p>
 
     <form method="post" action="/tap/forget">
@@ -324,6 +366,74 @@ PHONE_HTML = """<!DOCTYPE html>
     setTimeout(closePopup, 5000);
   </script>
   {% endif %}
+
+  <!-- "Scan NFC tag" pop-up -->
+  <div class="overlay" id="scanPopup" hidden>
+    <div class="card popup">
+      <div class="nfc-waves" aria-hidden="true"><span></span><span></span><span></span></div>
+      <h1>Scan NFC</h1>
+      <p class="sub" id="scanHelp">Hold the top of your phone near the clock-in tag.</p>
+      <div class="error" id="scanError" hidden></div>
+      <button class="btn ghost" type="button" onclick="closeScan()">Cancel</button>
+    </div>
+  </div>
+  <script>
+    // iPhones: Safari can't read NFC from a web page, but an unlocked iPhone
+    // reads the tag by itself and opens its link, so the pop-up just says
+    // where to hold it. Android Chrome: Web NFC can start the scan right
+    // here (https only); when the tag is read we open its link, which
+    // clocks the person in or out exactly like a normal tap.
+    const isIPhone = /iPhone|iPad|iPod/.test(navigator.userAgent)
+      || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    let scanAbort = null;
+
+    function scanMessage(text, isError) {
+      document.getElementById("scanHelp").hidden = !!isError;
+      const err = document.getElementById("scanError");
+      err.hidden = !isError;
+      if (isError) err.textContent = text; else document.getElementById("scanHelp").textContent = text;
+    }
+
+    async function openScan() {
+      document.getElementById("scanPopup").hidden = false;
+      if (isIPhone) {
+        scanMessage("Hold the top of your iPhone near the tag. Keep the screen on and unlocked; " +
+                    "your iPhone reads it automatically.");
+        return;
+      }
+      if (!("NDEFReader" in window)) {
+        scanMessage("Hold the back of your phone near the tag. If nothing happens, check NFC is " +
+                    "turned on in your phone's settings.");
+        return;
+      }
+      scanMessage("Hold the back of your phone near the tag…");
+      try {
+        scanAbort = new AbortController();
+        const reader = new NDEFReader();
+        await reader.scan({ signal: scanAbort.signal });
+        reader.onreading = event => {
+          const decoder = new TextDecoder();
+          for (const record of event.message.records) {
+            if (record.recordType === "url" || record.recordType === "absolute-url") {
+              const url = decoder.decode(record.data);
+              if (url.includes("/tap?")) { closeScan(); location.href = url; return; }
+            }
+          }
+          scanMessage("That isn't the clock-in tag. Try again.", true);
+        };
+        reader.onreadingerror = () => scanMessage("Couldn't read the tag. Hold it still and try again.", true);
+      } catch (e) {
+        scanMessage(e.name === "NotAllowedError"
+          ? "NFC permission was blocked. Allow it in your browser's site settings."
+          : "Hold the back of your phone near the tag. (In-page scanning needs the https link.)", true);
+      }
+    }
+
+    function closeScan() {
+      if (scanAbort) { scanAbort.abort(); scanAbort = null; }
+      document.getElementById("scanPopup").hidden = true;
+    }
+  </script>
 
   {% if started_ms %}
   <script>
@@ -441,21 +551,12 @@ def create_blueprint(clock_response, log_event):
         return secrets.compare_digest(given, current_token())
 
     def clock(pin):
-        """Flip the lever, honouring the double-tap guard."""
-        now = time.monotonic()
-        previous = recent_taps.get(pin)
-        if previous and now - previous[0] < TAP_COOLDOWN_SECONDS:
-            log_event("nfc_tap", {"pin": pin, "result": "repeat ignored"})
-            return {**previous[1], "repeat": True}
-
+        """Flip the lever. app.py's clock_response() holds the double-tap
+        guard, shared with the kiosk and card scanner."""
         response = clock_response(pin, "NFC")
-        log_event("nfc_tap", {"pin": pin, "result": response.get("action") or response.get("message")})
-        if response["ok"]:
-            recent_taps[pin] = (now, response)
-            if response["action"] == cs.CLOCKED_IN:
-                shift_started[pin] = time.time()
-            else:
-                shift_started.pop(pin, None)
+        outcome = "repeat ignored" if response.get("repeat") else (
+            response.get("action") or response.get("message"))
+        log_event("nfc_tap", {"pin": pin, "result": outcome})
         return response
 
     def status_url(**extra):
@@ -515,7 +616,7 @@ def create_blueprint(clock_response, log_event):
             resp = make_response(page(view="result", result=response, remembered=False))
         if remember:
             resp.set_cookie(
-                DEVICE_COOKIE, remember_device(pin),
+                DEVICE_COOKIE, remember_device(pin, request.headers.get("User-Agent", "")),
                 max_age=DEVICE_COOKIE_DAYS * 24 * 3600,
                 httponly=True, samesite="Lax", secure=request.is_secure,
             )
@@ -534,12 +635,12 @@ def create_blueprint(clock_response, log_event):
 
         record = cs.employee_records[pin]
         on_shift = record["status"] == "clocked_in"
-        started = shift_started.get(pin) if on_shift else None
+        started = record.get("since") if on_shift else None
         return page(
             view="status",
             name=record["name"],
             on_shift=on_shift,
-            started_label=datetime.fromtimestamp(started).strftime("%-I:%M %p") if started else None,
+            started_label=datetime.fromtimestamp(started).strftime("%I:%M %p").lstrip("0") if started else None,
             started_ms=int(started * 1000) if started else None,
             just=request.args.get("just"),
             at=request.args.get("at", ""),
@@ -550,7 +651,7 @@ def create_blueprint(clock_response, log_event):
     @bp.route("/tap/forget", methods=["POST"])
     def forget_this_phone():
         """ "Not you?" on the phone: drop the remembered link and start over."""
-        remembered_devices.pop(request.cookies.get(DEVICE_COOKIE, ""), None)
+        forget_device(request.cookies.get(DEVICE_COOKIE, ""))
         resp = redirect(f"/tap?t={request.form.get('t', '')}")
         resp.delete_cookie(DEVICE_COOKIE)
         return resp
@@ -602,13 +703,13 @@ def create_blueprint(clock_response, log_event):
         pin = cs.clean_pin(data.get("pin"))
         response = clock(pin)
         if response["ok"] and data.get("remember", True):
-            response = {**response, "device": remember_device(pin)}
+            response = {**response, "device": remember_device(pin, request.headers.get("User-Agent", ""))}
             log_event("nfc_remember_phone", {"pin": pin, "via": "app"})
         return jsonify(response)
 
     @bp.route("/api/app/forget", methods=["POST"])
     def app_forget():
-        remembered_devices.pop(str(body().get("device", "")), None)
+        forget_device(str(body().get("device", "")))
         return jsonify({"ok": True})
 
     @bp.route("/nfc/forget", methods=["POST"])
