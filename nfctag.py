@@ -53,7 +53,12 @@ import clock_system as cs
 # ---------------------------------------------------------------------
 # Kept in a small file next to this module so the link on the tag survives
 # server restarts. Delete the file (or press "Make a new link") to replace it.
-TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nfc_site_token.txt")
+# NFC_DATA_DIR lets Docker keep this file in a volume, so rebuilding the
+# container doesn't wipe the code (and break the link on the tag).
+TOKEN_FILE = os.path.join(
+    os.environ.get("NFC_DATA_DIR") or os.path.dirname(os.path.abspath(__file__)),
+    "nfc_site_token.txt",
+)
 
 
 def _load_or_create_token() -> str:
@@ -98,11 +103,51 @@ DEVICE_COOKIE_DAYS = 365
 # device ID -> PIN
 remembered_devices = {}
 
+# device ID -> {"kind": "iPhone", "added": time.time()}, so the admin page
+# can tell one person's phones apart ("iPhone, remembered Oct 3") and
+# forget just the old one when someone switches phones.
+device_info = {}
 
-def remember_device(pin: str) -> str:
+
+def phone_kind(user_agent: str) -> str:
+    """A rough, human label for a phone from its browser's User-Agent."""
+    ua = user_agent or ""
+    for needle, label in (("iPhone", "iPhone"), ("iPad", "iPad"), ("Android", "Android phone")):
+        if needle in ua:
+            return label
+    return "Phone"
+
+
+def remember_device(pin: str, user_agent: str = "") -> str:
     device_id = secrets.token_urlsafe(24)
     remembered_devices[device_id] = cs.clean_pin(pin)
+    device_info[device_id] = {"kind": phone_kind(user_agent), "added": time.time()}
     return device_id
+
+
+def forget_device(device_id: str) -> bool:
+    """Forget one phone. Returns False if it wasn't remembered."""
+    device_info.pop(device_id or "", None)
+    return remembered_devices.pop(device_id or "", None) is not None
+
+
+def devices_for(pin: str):
+    """This employee's remembered phones, oldest first:
+    [{"id": ..., "kind": "iPhone", "added": 1696000000.0}, ...]"""
+    pin = cs.clean_pin(pin)
+    phones = [
+        {"id": d, **device_info.get(d, {"kind": "Phone", "added": 0})}
+        for d, p in remembered_devices.items() if p == pin
+    ]
+    return sorted(phones, key=lambda ph: ph["added"])
+
+
+def move_devices(old_pin: str, new_pin: str) -> None:
+    """Keep someone's phones working after their PIN changes."""
+    old_pin, new_pin = cs.clean_pin(old_pin), cs.clean_pin(new_pin)
+    for d, p in list(remembered_devices.items()):
+        if p == old_pin:
+            remembered_devices[d] = new_pin
 
 
 def device_pin(device_id):
@@ -117,25 +162,8 @@ def forget_devices_for(pin: str) -> int:
     pin = cs.clean_pin(pin)
     doomed = [d for d, p in remembered_devices.items() if p == pin]
     for d in doomed:
-        del remembered_devices[d]
+        forget_device(d)
     return len(doomed)
-
-
-# ---------------------------------------------------------------------
-# Double-tap guard
-# ---------------------------------------------------------------------
-# A tap clocks in or out instantly, and phones sometimes open the link twice
-# for one tap. Within this window a repeat just shows the earlier result
-# instead of clocking the person straight back out.
-TAP_COOLDOWN_SECONDS = 10
-
-# PIN -> (time.monotonic() of the tap, the response it got)
-recent_taps = {}
-
-# PIN -> when their current shift started (wall-clock seconds), for the
-# phone's status page. Set on a phone clock-in; other methods leave it unset
-# and the page just doesn't show a timer.
-shift_started = {}
 
 
 def lan_base_url() -> str:
@@ -143,7 +171,13 @@ def lan_base_url() -> str:
 
     The admin page is often opened as localhost, which a phone can't reach,
     so this finds the computer's own network address instead.
+
+    Set PUBLIC_URL (e.g. http://192.168.1.20:5000) to override it. That's
+    required under Docker, where the detected address is the container's
+    internal one, which phones can't reach.
     """
+    if os.environ.get("PUBLIC_URL"):
+        return os.environ["PUBLIC_URL"].rstrip("/")
     scheme = request.scheme
     port = request.host.rsplit(":", 1)[1] if ":" in request.host else ""
     try:
@@ -517,21 +551,12 @@ def create_blueprint(clock_response, log_event):
         return secrets.compare_digest(given, current_token())
 
     def clock(pin):
-        """Flip the lever, honouring the double-tap guard."""
-        now = time.monotonic()
-        previous = recent_taps.get(pin)
-        if previous and now - previous[0] < TAP_COOLDOWN_SECONDS:
-            log_event("nfc_tap", {"pin": pin, "result": "repeat ignored"})
-            return {**previous[1], "repeat": True}
-
+        """Flip the lever. app.py's clock_response() holds the double-tap
+        guard, shared with the kiosk and card scanner."""
         response = clock_response(pin, "NFC")
-        log_event("nfc_tap", {"pin": pin, "result": response.get("action") or response.get("message")})
-        if response["ok"]:
-            recent_taps[pin] = (now, response)
-            if response["action"] == cs.CLOCKED_IN:
-                shift_started[pin] = time.time()
-            else:
-                shift_started.pop(pin, None)
+        outcome = "repeat ignored" if response.get("repeat") else (
+            response.get("action") or response.get("message"))
+        log_event("nfc_tap", {"pin": pin, "result": outcome})
         return response
 
     def status_url(**extra):
@@ -591,7 +616,7 @@ def create_blueprint(clock_response, log_event):
             resp = make_response(page(view="result", result=response, remembered=False))
         if remember:
             resp.set_cookie(
-                DEVICE_COOKIE, remember_device(pin),
+                DEVICE_COOKIE, remember_device(pin, request.headers.get("User-Agent", "")),
                 max_age=DEVICE_COOKIE_DAYS * 24 * 3600,
                 httponly=True, samesite="Lax", secure=request.is_secure,
             )
@@ -610,7 +635,7 @@ def create_blueprint(clock_response, log_event):
 
         record = cs.employee_records[pin]
         on_shift = record["status"] == "clocked_in"
-        started = shift_started.get(pin) if on_shift else None
+        started = record.get("since") if on_shift else None
         return page(
             view="status",
             name=record["name"],
@@ -626,7 +651,7 @@ def create_blueprint(clock_response, log_event):
     @bp.route("/tap/forget", methods=["POST"])
     def forget_this_phone():
         """ "Not you?" on the phone: drop the remembered link and start over."""
-        remembered_devices.pop(request.cookies.get(DEVICE_COOKIE, ""), None)
+        forget_device(request.cookies.get(DEVICE_COOKIE, ""))
         resp = redirect(f"/tap?t={request.form.get('t', '')}")
         resp.delete_cookie(DEVICE_COOKIE)
         return resp
@@ -678,13 +703,13 @@ def create_blueprint(clock_response, log_event):
         pin = cs.clean_pin(data.get("pin"))
         response = clock(pin)
         if response["ok"] and data.get("remember", True):
-            response = {**response, "device": remember_device(pin)}
+            response = {**response, "device": remember_device(pin, request.headers.get("User-Agent", ""))}
             log_event("nfc_remember_phone", {"pin": pin, "via": "app"})
         return jsonify(response)
 
     @bp.route("/api/app/forget", methods=["POST"])
     def app_forget():
-        remembered_devices.pop(str(body().get("device", "")), None)
+        forget_device(str(body().get("device", "")))
         return jsonify({"ok": True})
 
     @bp.route("/nfc/forget", methods=["POST"])
