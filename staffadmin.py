@@ -31,9 +31,11 @@ Columns (header row required, any order, extra columns ignored):
     Job title       optional
     ID card number  optional: the barcode on their school ID card
 
-Nobody's PIN goes in the sheet. Each imported person gets a temporary code,
-listed after the import (and downloadable as a CSV) so they can be handed
-out; at the kiosk each person then chooses their own PIN, as usual.
+Nobody's PIN goes in the sheet. Each imported person gets a code, listed
+after the import (and downloadable as a CSV) so they can be handed out.
+What the code is depends on the PIN policy on /admin:
+  - "choose":   a temporary code; they choose their own PIN at the kiosk.
+  - "assigned": their permanent PIN, picked at random.
 
 A row whose name already belongs to an employee is skipped, so an updated
 sheet can be uploaded again without making duplicates. A name listed twice
@@ -388,9 +390,9 @@ def create_blueprint(log_event, base_css, site, on_pin_moved, on_status_correcte
             added.append({"name": r["name"], "title": r["title"], "badge": r["badge"], "code": code})
 
         token2 = secrets.token_urlsafe(12)
-        finished_imports[token2] = {"created": time.time(), "added": added}
+        finished_imports[token2] = {"created": time.time(), "added": added, "assigned": cs.pins_assigned()}
         log_event("staff_imported", {"added": len(added), "source": pending["source"]})
-        return page(RESULT_HTML, token=token2, added=added,
+        return page(RESULT_HTML, token=token2, added=added, assigned=cs.pins_assigned(),
                     dropped=len([r for r in pending["rows"] if r["action"] == "add"]) - len(added))
 
     @bp.route("/admin/import/<token>/codes.csv")
@@ -400,11 +402,13 @@ def create_blueprint(log_event, base_css, site, on_pin_moved, on_status_correcte
             return to_dashboard("That list has expired. The codes are still on the dashboard table.", "error")
         out = io.StringIO()
         w = csv.writer(out)
-        w.writerow(["Name", "Temporary code", "Job title", "ID card number"])
+        code_label = "PIN" if done.get("assigned") else "Temporary code"
+        w.writerow(["Name", code_label, "Job title", "ID card number"])
         for a in done["added"]:
             w.writerow([a["name"], a["code"], a["title"], a["badge"]])
         return Response(out.getvalue(), mimetype="text/csv",
-                        headers={"Content-Disposition": "attachment; filename=temporary-codes.csv"})
+                        headers={"Content-Disposition": "attachment; filename="
+                                 + ("staff-pins.csv" if done.get("assigned") else "temporary-codes.csv")})
 
     # ---- edit one employee --------------------------------------------
 
@@ -418,7 +422,7 @@ def create_blueprint(log_event, base_css, site, on_pin_moved, on_status_correcte
         if record is None:
             return to_dashboard("That employee doesn't exist anymore.", "error")
         phones = [{**ph, "when": _fmt_time(ph["added"])} for ph in nfctag.devices_for(pin)]
-        return page(EDIT_HTML, pin=pin, record=record, phones=phones,
+        return page(EDIT_HTML, pin=pin, record=record, phones=phones, pins_assigned=cs.pins_assigned(),
                     since=_fmt_time(record.get("since")) if record.get("since") else None,
                     notice=request.args.get("notice"), notice_kind=request.args.get("kind", "ok"),
                     min_len=cs.MIN_PIN_LENGTH, max_len=cs.MAX_PIN_LENGTH,
@@ -456,6 +460,9 @@ def create_blueprint(log_event, base_css, site, on_pin_moved, on_status_correcte
         pin, record = load(pin)
         if record is None:
             return to_dashboard("That employee doesn't exist anymore.", "error")
+        if cs.pins_assigned():
+            return to_editor(pin, "PINs are assigned by the system. Use 'Assign a new random PIN' instead.",
+                             "error")
         new = cs.clean_pin(request.form.get("new_pin"))
         if new == pin:
             return to_editor(pin, "That's already their PIN.", "error")
@@ -475,9 +482,11 @@ def create_blueprint(log_event, base_css, site, on_pin_moved, on_status_correcte
         pin, record = load(pin)
         if record is None:
             return to_dashboard("That employee doesn't exist anymore.", "error")
-        new = cs.reset_to_temporary_code(pin)
+        new = cs.reissue_pin(pin)
         on_pin_moved(pin, new)
         log_event("staff_pin_reset", {"from": pin, "to": new})
+        if cs.pins_assigned():
+            return to_editor(new, f"New PIN: {new}. Give it to {record['name']}; their old PIN no longer works.")
         return to_editor(new, f"New temporary code: {new}. Give it to {record['name']}; "
                               "they'll choose a new PIN the next time they use it at the kiosk.")
 
@@ -609,7 +618,8 @@ RESULT_HTML = """<!DOCTYPE html>
   <h1>{{ added|length }} staff member{{ 's' if added|length != 1 }} added</h1>
   {% if dropped %}<div class="notice warn no-print">{{ dropped }} row(s) from the preview were left out because
     something changed in the meantime (e.g. that name or card was added by someone else).</div>{% endif %}
-  <p class="sub">Give each person their temporary code. At the kiosk they enter it once and choose their own PIN.
+  <p class="sub">{% if assigned %}Give each person their PIN. It's assigned by the system and they can't change it.
+    {% else %}Give each person their temporary code. At the kiosk they enter it once and choose their own PIN.{% endif %}
     Save or print this list now: the codes won't be shown together again.</p>
 
   <div class="row no-print">
@@ -619,7 +629,7 @@ RESULT_HTML = """<!DOCTYPE html>
 
   <div class="panel">
     <table>
-      <thead><tr><th>Name</th><th>Temporary code</th><th>Job title</th><th>ID card</th></tr></thead>
+      <thead><tr><th>Name</th><th>{{ 'PIN' if assigned else 'Temporary code' }}</th><th>Job title</th><th>ID card</th></tr></thead>
       <tbody>
       {% for a in added %}
         <tr><td>{{ a.name }}</td><td class="code mono">{{ a.code }}</td>
@@ -690,6 +700,7 @@ EDIT_HTML = """<!DOCTYPE html>
   <div class="panel">
     <h2>PIN</h2>
     <div class="row" style="margin-top:12px">
+      {% if not pins_assigned %}
       <form class="row" method="post" action="/admin/employee/{{ pin }}/pin">
         <label>New PIN <input type="text" name="new_pin" inputmode="numeric" pattern="[0-9]{{ '{' }}{{ min_len }},{{ max_len }}{{ '}' }}"
             maxlength="{{ max_len }}" placeholder="{{ min_len }}-{{ max_len }} digits" autocomplete="off" required></label>
@@ -698,6 +709,12 @@ EDIT_HTML = """<!DOCTYPE html>
       <form method="post" action="/admin/employee/{{ pin }}/reset-pin"
             onsubmit='return confirm({{ ("Give " ~ record.name ~ " a new temporary code? Their current PIN stops working.")|tojson }})'>
         <button class="btn" type="submit">Forgot PIN: issue temporary code</button></form>
+      {% else %}
+      <form method="post" action="/admin/employee/{{ pin }}/reset-pin"
+            onsubmit='return confirm({{ ("Give " ~ record.name ~ " a new random PIN? Their current PIN stops working.")|tojson }})'>
+        <button class="btn" type="submit">Assign a new random PIN</button></form>
+      <span class="sub">PINs are assigned by the system (change this under PIN policy on the dashboard).</span>
+      {% endif %}
     </div>
   </div>
 
