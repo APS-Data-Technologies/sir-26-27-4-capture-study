@@ -71,7 +71,21 @@ BADGE_BAD_FORMAT = "badge value is empty or too long"
 EMPLOYEE_REMOVED = "employee removed"
 NAME_MISMATCH = "typed name does not match"
 
-MAX_BADGE_LENGTH = 64  # school ID barcodes are short; this only rejects junk
+MAX_BADGE_LENGTH = 64
+
+# ---------------------------------------------------------------------
+# PIN policy: who decides each employee's PIN
+# ---------------------------------------------------------------------
+#   "choose"    New staff get a temporary code and choose their own PIN the
+#               first time they use it at the kiosk.
+#   "assigned"  New staff get a random PIN from randomcode() and keep it.
+#               Nobody chooses; the kiosk skips the "choose your PIN" step.
+# app.py loads and saves this so it survives restarts; change it with
+# set_pin_mode() rather than assigning to it directly.
+PIN_MODE_CHOOSE = "choose"
+PIN_MODE_ASSIGNED = "assigned"
+pin_mode = PIN_MODE_CHOOSE
+PINS_ARE_ASSIGNED = "pins are assigned; employees can't choose their own"  # school ID barcodes are short; this only rejects junk
 
 
 def randomcode():
@@ -175,7 +189,8 @@ def register_employee(name: str) -> str:
     employee_records[new_pin] = {
         "name": name,
         "status": "clocked_out",
-        "temporary": True,
+        # In "assigned" mode the issued code IS their PIN, nothing to choose.
+        "temporary": not pins_assigned(),
         "google_email": None,
         "badge": None,
         "since": None,
@@ -395,21 +410,54 @@ def unlink_badge(pin: str) -> str:
 # ---------------------------------------------------------------------
 # 8b. Admin: put someone back on a fresh temporary code (forgot their PIN)
 # ---------------------------------------------------------------------
-def reset_to_temporary_code(pin: str) -> Optional[str]:
+def reissue_pin(pin: str) -> Optional[str]:
     """
-    Moves an employee onto a newly issued temporary code, as if they were a
-    new hire again: next time they enter it at the kiosk they choose a new
-    PIN. Returns the new code, or None if `pin` isn't registered.
+    Gives an employee a freshly generated code (they forgot their PIN).
+    Returns the new code, or None if `pin` isn't registered.
     Everything else on their record (name, card, clock status) is kept.
+
+    "choose" mode:   it's a temporary code; they choose a new PIN the next
+                     time they enter it at the kiosk.
+    "assigned" mode: it's simply their new PIN.
     """
     pin = clean_pin(pin)
     if pin not in employee_records:
         return None
     new_code = generate_unique_pin()
     record = employee_records.pop(pin)
-    record["temporary"] = True
+    record["temporary"] = not pins_assigned()
     employee_records[new_code] = record
     return new_code
+
+
+# Older name, kept so existing callers keep working.
+reset_to_temporary_code = reissue_pin
+
+
+def pins_assigned() -> bool:
+    """True when the system assigns PINs and employees can't choose."""
+    return pin_mode == PIN_MODE_ASSIGNED
+
+
+def set_pin_mode(mode: str) -> int:
+    """
+    Switches the PIN policy. Returns how many employees were affected:
+    switching to "assigned" turns everyone still on a temporary code into a
+    permanent PIN (the code they were handed simply stays theirs).
+    Switching back to "choose" changes nobody's PIN; only new staff get
+    temporary codes again.
+    """
+    global pin_mode
+    if mode not in (PIN_MODE_CHOOSE, PIN_MODE_ASSIGNED):
+        raise ValueError(f"unknown PIN mode: {mode!r}")
+    pin_mode = mode
+    finalized = 0
+    if mode == PIN_MODE_ASSIGNED:
+        for record in employee_records.values():
+            if record["temporary"]:
+                record["temporary"] = False
+                finalized += 1
+    return finalized
 
 
 # ---------------------------------------------------------------------
