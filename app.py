@@ -2,9 +2,10 @@
 Clock-in kiosk prototype — UI layer.
 
 Two screens:
-    /           employee kiosk (PIN entry, Google sign-in, ID card scan)
+    /           employee kiosk (PIN entry, ID card scan)
     /dashboard  employer view (summary tiles, staff table, registration,
-                linking school ID cards)
+                linking school ID cards, digital ID cards via digitalID.py,
+                spreadsheet import + edit employee via staffadmin.py)
 
 Run:
     pip install flask
@@ -22,7 +23,6 @@ RETURNING employee
     types their 4-6 digit PIN -> popup shows the name on file
     -> "Yes, that's me" flips the clock lever
     -> "No, try again" clears and returns to the numpad.
-    Or they tap Sign in with Google and skip the PIN entirely.
     Or they scan their school ID card: that clocks them in or out at once.
     Or they tap the NFC wall tag with their own phone (nfctag.py).
 
@@ -42,6 +42,7 @@ added later by calling that same function.
 """
 
 import os
+import threading
 import time
 from datetime import datetime
 
@@ -56,6 +57,8 @@ from flask import (
 
 import clock_system as cs
 import nfctag
+import digitalID
+import staffadmin
 
 app = Flask(__name__)
 
@@ -74,24 +77,6 @@ def log_event(event_type, detail=None):
     print(f"[event] {event_type} {detail or ''}")
 
 
-# --- Google sign-in stand-in -----------------------------------------
-# Real Google OAuth needs a Google Cloud client ID + secret and an HTTPS
-# redirect URI. Until those exist, this fake account picker stands in so
-# the linking flow can be built and demoed. To go live, replace
-# google_accounts() and the /api/google/signin route with a real OAuth
-# round trip; everything downstream (link, lookup, clock) is unchanged.
-GOOGLE_IS_STUBBED = True
-
-
-def google_accounts():
-    """Accounts the fake picker offers. Replace with real OAuth."""
-    return [
-        {"email": "sample.person@school.org", "name": "Sample Person"},
-        {"email": "test.employee@school.org", "name": "Test Employee"},
-        {"email": "new.hire@school.org", "name": "New Hire"},
-    ]
-
-
 # clock_system tracks WHO is in or out, but not WHEN. The dashboard wants
 # a time per person, so the kiosk records one here as punches come in.
 # Keyed by PIN -> {"time": "7:52 AM", "method": "PIN"}.
@@ -99,14 +84,19 @@ def google_accounts():
 last_punch = {}
 
 
-# A scan clocks in or out instantly, so a card scanned twice in a row (a
-# double beep, or someone unsure the first one took) would clock them in
-# and straight back out. Within this window a repeat scan of the same card
-# just shows the earlier result again instead of flipping the lever.
-SCAN_COOLDOWN_SECONDS = 10
+# Double-clock guard, shared by EVERY way of clocking (PIN, ID card, NFC).
+# A double beep, a nervous second tap, or a card scan followed by an NFC tap
+# would otherwise clock someone in and straight back out. Within this window
+# any repeat for the same person just shows the latest result again.
+CLOCK_COOLDOWN_SECONDS = 10
 
-# PIN -> (time.monotonic() of the scan, the response it got)
-recent_scans = {}
+# PIN -> (time.monotonic() of their last clock, the response it got)
+recent_clocks = {}
+
+# Flask serves requests on several threads at once, so two requests for the
+# same person (a phone that opens the tag link twice) could otherwise both
+# pass the guard before either one flips the lever.
+clock_lock = threading.Lock()
 
 
 def load_punches():
@@ -119,7 +109,6 @@ def load_punches():
             "id": pin,
             "status": "in" if record["status"] == "clocked_in" else "out",
             "temporary": record["temporary"],
-            "google": record.get("google_email") or "",
             "badge": record.get("badge") or "",
             "time": punch.get("time", "—"),
             "method": punch.get("method", "—"),
@@ -155,7 +144,7 @@ SITE_LABEL = "Main Office"
 
 def record_punch(pin, method):
     """Note the time and capture method for the dashboard's last-punch column."""
-    last_punch[pin] = {"time": datetime.now().strftime("%-I:%M %p"), "method": method}
+    last_punch[pin] = {"time": datetime.now().strftime("%I:%M %p").lstrip("0"), "method": method}
 
 
 # What the kiosk says when clock_system refuses to flip the lever.
@@ -166,19 +155,57 @@ CLOCK_FAILURE_MESSAGES = {
 
 
 def clock_response(pin, method):
-    """Flip the lever via clock_system and shape the kiosk's reply (a dict)."""
-    result = cs.process_clock_entry(pin)
+    """Flip the lever via clock_system and shape the reply (a dict).
 
-    if result in (cs.CLOCKED_IN, cs.CLOCKED_OUT):
-        record_punch(cs.clean_pin(pin), method)
-        return {
+    Every clock-in/out goes through here, whatever the method, so the
+    double-clock guard sees them all. A repeat inside the cooldown returns
+    the latest result with "repeat": True instead of flipping again.
+    """
+    pin = cs.clean_pin(pin)
+    with clock_lock:
+        now = time.monotonic()
+        previous = recent_clocks.get(pin)
+        if previous and now - previous[0] < CLOCK_COOLDOWN_SECONDS:
+            return {**previous[1], "repeat": True}
+
+        result = cs.process_clock_entry(pin)
+        if result not in (cs.CLOCKED_IN, cs.CLOCKED_OUT):
+            return {"ok": False, "message": CLOCK_FAILURE_MESSAGES.get(result, result)}
+
+        record_punch(pin, method)
+        response = {
             "ok": True,
-            "name": cs.employee_records[cs.clean_pin(pin)]["name"],
+            "name": cs.employee_records[pin]["name"],
             "action": result,
-            "time": datetime.now().strftime("%-I:%M:%S %p"),
+            "time": datetime.now().strftime("%I:%M:%S %p").lstrip("0"),
         }
+        recent_clocks[pin] = (now, response)
+        return response
 
-    return {"ok": False, "message": CLOCK_FAILURE_MESSAGES.get(result, result)}
+
+def clock_outcome(response):
+    """One word for the event log: what happened to this clock attempt."""
+    if response.get("repeat"):
+        return "repeat ignored"
+    return response.get("action") or response.get("message")
+
+
+def move_pin_state(old_pin, new_pin):
+    """Someone's PIN changed (they chose one, or an admin changed or reset
+    it). Move everything this app keeps per PIN, so their last punch,
+    double-clock guard and remembered phones follow them."""
+    with clock_lock:
+        for store in (last_punch, recent_clocks):
+            if old_pin in store:
+                store[new_pin] = store.pop(old_pin)
+    nfctag.move_devices(old_pin, new_pin)
+
+
+def status_corrected(pin):
+    """An admin fixed someone's clock status by hand."""
+    with clock_lock:
+        recent_clocks.pop(pin, None)          # the old result no longer applies
+    record_punch(pin, "Admin")
 
 
 # NFC tags live in their own module; see nfctag.py for how they work.
@@ -196,7 +223,6 @@ def kiosk():
         site=SITE_LABEL,
         min_len=cs.MIN_PIN_LENGTH,
         max_len=cs.MAX_PIN_LENGTH,
-        google_stubbed=GOOGLE_IS_STUBBED,
     )
 
 
@@ -215,10 +241,12 @@ def dashboard():
         site=SITE_LABEL,
         punches=punches,
         counts=counts,
-        today=datetime.now().strftime("%A, %B %-d, %Y"),
+        today=f"{datetime.now():%A, %B} {datetime.now().day}, {datetime.now():%Y}",
         new_pin=request.args.get("pin"),
         new_name=request.args.get("name"),
         nfc_panel=nfctag.admin_panel(),
+        digital_id_panel=digitalID.admin_panel(),
+        import_panel=staffadmin.admin_panel(),
         notice=request.args.get("notice"),
         notice_kind=request.args.get("kind", "ok"),
     )
@@ -279,8 +307,7 @@ def remove_employee(pin):
                 # Clear everything else this app held for that PIN, so the
                 # next person to get it starts clean.
                 last_punch.pop(pin, None)
-                recent_scans.pop(pin, None)
-                nfctag.recent_taps.pop(pin, None)
+                recent_clocks.pop(pin, None)
                 phones = nfctag.forget_devices_for(pin)
                 log_event("employee_removed", {"pin": pin, "phones_forgotten": phones})
                 return redirect(url_for(
@@ -340,8 +367,9 @@ def api_lookup():
 def api_clock():
     """Step 2: they confirmed the name on the popup. Flip the lever."""
     pin = cs.clean_pin((request.get_json(silent=True) or {}).get("pin"))
-    log_event("confirm", {"pin": pin})
-    return jsonify(clock_response(pin, "PIN"))
+    response = clock_response(pin, "PIN")
+    log_event("confirm", {"pin": pin, "result": clock_outcome(response)})
+    return jsonify(response)
 
 
 @app.route("/api/set-pin", methods=["POST"])
@@ -355,6 +383,7 @@ def api_set_pin():
     log_event("set_pin", {"from": current, "result": result})
 
     if result == cs.PIN_SET:
+        move_pin_state(current, chosen)
         return jsonify({"ok": True, "name": cs.employee_records[chosen]["name"]})
 
     messages = {
@@ -363,70 +392,6 @@ def api_set_pin():
         cs.DOES_NOT_EXIST: "That code isn't registered. Start over.",
     }
     return jsonify({"ok": False, "message": messages.get(result, result)})
-
-
-# --- Google sign-in (stubbed) ----------------------------------------
-
-@app.route("/api/google/accounts", methods=["GET"])
-def api_google_accounts():
-    """The fake account picker's contents. Replace with real OAuth."""
-    return jsonify({"accounts": google_accounts()})
-
-
-@app.route("/api/google/signin", methods=["POST"])
-def api_google_signin():
-    """An account was picked. Is it already linked to an employee?"""
-    email = ((request.get_json(silent=True) or {}).get("email") or "").strip()
-    pin = cs.find_by_google_email(email)
-
-    if pin is None:
-        log_event("google_signin", {"email": email, "result": "needs link"})
-        return jsonify({"state": "needs_link", "email": email})
-
-    record = cs.employee_records[pin]
-    log_event("google_signin", {"email": email, "result": "linked"})
-    return jsonify({
-        "state": "linked",
-        "email": email,
-        "pin": pin,
-        "name": record["name"],
-        "clocked_in": record["status"] == "clocked_in",
-    })
-
-
-@app.route("/api/google/link", methods=["POST"])
-def api_google_link():
-    """The one-time link: PIN once, Google from then on."""
-    payload = request.get_json(silent=True) or {}
-    email = (payload.get("email") or "").strip()
-    pin = cs.clean_pin(payload.get("pin"))
-
-    record = cs.lookup(pin)
-    if record is not None and record["temporary"]:
-        return jsonify({
-            "ok": False,
-            "message": "Set up your own PIN at the kiosk first, then link Google.",
-        })
-
-    result = cs.link_google_account(pin, email)
-    log_event("google_link", {"email": email, "pin": pin, "result": result})
-
-    if result == cs.GOOGLE_LINKED:
-        return jsonify({"ok": True, "pin": pin, "name": cs.employee_records[pin]["name"]})
-
-    messages = {
-        cs.DOES_NOT_EXIST: "That PIN isn't registered. Check it and try again.",
-        cs.GOOGLE_ALREADY_LINKED: "That Google account is already linked to someone else.",
-    }
-    return jsonify({"ok": False, "message": messages.get(result, result)})
-
-
-@app.route("/api/google/clock", methods=["POST"])
-def api_google_clock():
-    """Confirmed from a Google sign-in. Flip the lever."""
-    pin = cs.clean_pin((request.get_json(silent=True) or {}).get("pin"))
-    log_event("confirm", {"pin": pin, "via": "google"})
-    return jsonify(clock_response(pin, "Google"))
 
 
 # --- ID card scan ----------------------------------------------------
@@ -446,23 +411,10 @@ def api_badge_scan():
             "message": "This ID card isn't linked to anyone yet. See your site lead.",
         })
 
-    # Same card again within the cooldown: show the earlier result instead
-    # of clocking them straight back out.
-    now = time.monotonic()
-    previous = recent_scans.get(pin)
-    if previous and now - previous[0] < SCAN_COOLDOWN_SECONDS:
-        log_event("badge_scan", {"badge": badge, "source": source, "result": "repeat ignored"})
-        return jsonify({**previous[1], "repeat": True})
-
+    # clock_response() ignores a repeat within the cooldown, so a double
+    # beep can't clock someone in and straight back out.
     response = clock_response(pin, "Badge")
-    log_event("badge_scan", {
-        "badge": badge,
-        "source": source,
-        "result": response.get("action") or response.get("message"),
-    })
-
-    if response["ok"]:
-        recent_scans[pin] = (now, response)
+    log_event("badge_scan", {"badge": badge, "source": source, "result": clock_outcome(response)})
     return jsonify(response)
 
 
@@ -608,30 +560,6 @@ KIOSK_HTML = """<!DOCTYPE html>
   .actions .btn { flex: 1; }
   .actions .btn.primary { flex: 2; }
 
-  /* ---------- Google ---------- */
-  .divider { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 13px; }
-  .divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: var(--line); }
-
-  .google-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 10px;
-    width: 100%;
-    min-height: 58px;
-    border-radius: 12px;
-    border: 1px solid var(--line);
-    background: #fff;
-    color: #1f1f1f;
-    font-size: 16px;
-    font-weight: 600;
-    font-family: inherit;
-    cursor: pointer;
-  }
-  .google-btn:active { transform: translateY(1px); }
-  .g-mark { font-size: 19px; font-weight: 700; }
-  .g-note { text-align: center; font-size: 12px; color: var(--muted); }
-
   /* ---------- ID card scan hint ---------- */
   .scan-hint {
     display: flex;
@@ -714,25 +642,6 @@ KIOSK_HTML = """<!DOCTYPE html>
     margin: 0 auto;
   }
 
-  .account-list { display: flex; flex-direction: column; gap: 8px; }
-  .account {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    text-align: left;
-    background: var(--field);
-    border: 1px solid var(--line);
-    border-radius: 12px;
-    padding: 12px 14px;
-    color: var(--text);
-    font-family: inherit;
-    font-size: 15px;
-    cursor: pointer;
-  }
-  .account:active { background: var(--key-press); }
-  .account .avatar { width: 40px; height: 40px; font-size: 16px; line-height: 36px; margin: 0; }
-  .account-name { font-weight: 600; }
-  .account-email { font-size: 13px; color: var(--muted); }
 
   /* ---------- confirmation ---------- */
   .check {
@@ -761,11 +670,10 @@ KIOSK_HTML = """<!DOCTYPE html>
   .key { min-height: clamp(44px, 7.5vh, 66px); }
   .btn { min-height: clamp(44px, 6.5vh, 60px); }
   .field { min-height: clamp(56px, 8.5vh, 82px); }
-  .google-btn { min-height: clamp(44px, 6vh, 58px); }
   .admin-link { align-self: center; font-size: 12px; color: var(--muted); text-decoration: none; opacity: .7; }
   .admin-link:hover { opacity: 1; text-decoration: underline; }
 
-  /* Landscape (laptop, tablet on its side): info + Google on the left,
+  /* Landscape (laptop, tablet on its side): info on the left,
      PIN pad on the right, so nothing has to stack past the screen edge. */
   @media (orientation: landscape) and (min-width: 820px) {
     .card {
@@ -785,7 +693,6 @@ KIOSK_HTML = """<!DOCTYPE html>
   @media (max-height: 680px) {
     .key { min-height: 52px; font-size: 22px; }
     .field { min-height: 68px; }
-    .google-btn { min-height: 50px; }
   }
 </style>
 </head>
@@ -838,14 +745,6 @@ KIOSK_HTML = """<!DOCTYPE html>
    </div>
 
    <div class="col-alt">
-    <div class="divider">or</div>
-
-    <button class="google-btn" id="btnGoogle">
-      <span class="g-mark">G</span> Sign in with Google
-    </button>
-    {% if google_stubbed %}
-    <p class="g-note">Demo account picker — real Google OAuth not wired up yet.</p>
-    {% endif %}
     <a class="admin-link" href="/admin">Admin</a>
    </div>
   </div>
@@ -885,35 +784,6 @@ KIOSK_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- google: pick an account (stub) -->
-  <div class="popup" id="googlePicker" hidden>
-    <h2>Choose an account</h2>
-    <p class="sub">Demo picker standing in for Google sign-in.</p>
-    <div class="account-list" id="accountList"></div>
-    <div class="actions">
-      <button class="btn ghost" id="googleCancel">Cancel</button>
-    </div>
-  </div>
-
-  <!-- google: one-time link -->
-  <div class="popup" id="googleLink" hidden>
-    <h2>Link this account</h2>
-    <p class="sub">Enter your PIN once for <span id="linkEmail">—</span>. After this, Google alone signs you in.</p>
-    <div class="banner" id="linkBanner"></div>
-    <div class="field">
-      <div class="field-label">PIN</div>
-      <div class="field-value">
-        <span class="dots" id="linkDots"></span>
-        <span class="caret"></span>
-      </div>
-    </div>
-    <div class="numpad" id="linkNumpad"></div>
-    <div class="actions">
-      <button class="btn ghost" id="linkCancel">Cancel</button>
-      <button class="btn primary" id="linkSave" disabled>Link account</button>
-    </div>
-  </div>
-
   <!-- clocked in / out -->
   <div class="popup" id="confirmPopup" hidden>
     <div class="check" id="confirmIcon">&#10003;</div>
@@ -935,7 +805,7 @@ const $ = id => document.getElementById(id);
 const el = {
   entry: $("entry"), banner: $("banner"), overlay: $("overlay"), scanHint: $("scanHint"),
   pinDots: $("pinDots"), numpad: $("numpad"),
-  btnEnter: $("btnEnter"), btnClear: $("btnClear"), btnGoogle: $("btnGoogle"),
+  btnEnter: $("btnEnter"), btnClear: $("btnClear"),
   clock: $("clock"),
 
   confirmWho: $("confirmWho"), whoName: $("whoName"), whoState: $("whoState"),
@@ -945,12 +815,6 @@ const el = {
   setupNumpad: $("setupNumpad"), setupBanner: $("setupBanner"),
   setupLabel: $("setupLabel"), setupSave: $("setupSave"), setupCancel: $("setupCancel"),
 
-  googlePicker: $("googlePicker"), accountList: $("accountList"), googleCancel: $("googleCancel"),
-
-  googleLink: $("googleLink"), linkEmail: $("linkEmail"), linkDots: $("linkDots"),
-  linkNumpad: $("linkNumpad"), linkBanner: $("linkBanner"),
-  linkSave: $("linkSave"), linkCancel: $("linkCancel"),
-
   confirmPopup: $("confirmPopup"), confirmName: $("confirmName"),
   confirmAction: $("confirmAction"), confirmTime: $("confirmTime"),
   confirmIcon: $("confirmIcon"), confirmNote: $("confirmNote")
@@ -958,9 +822,8 @@ const el = {
 
 // pin        - what's typed on the main screen
 // setupValue - the new PIN a first-timer is choosing
-// linkValue  - the PIN typed to link a Google account
 // pendingPin - whose record the open popup is about
-const state = { pin: "", setupValue: "", linkValue: "", pendingPin: null, pendingEmail: null };
+const state = { pin: "", setupValue: "", pendingPin: null };
 
 function post(url, body) {
   return fetch(url, {
@@ -1045,7 +908,7 @@ function hideBanner(bannerEl) {
 
 /* ---------- popup plumbing ---------- */
 
-const POPUPS = ["confirmWho", "setupPin", "googlePicker", "googleLink", "confirmPopup"];
+const POPUPS = ["confirmWho", "setupPin", "confirmPopup"];
 
 function openPopup(name) {
   POPUPS.forEach(id => { el[id].hidden = id !== name; });
@@ -1113,9 +976,7 @@ function showWhoPopup(name, clockedIn) {
 }
 
 async function confirmWho() {
-  const viaGoogle = state.pendingEmail !== null;
-  const url = viaGoogle ? "/api/google/clock" : "/api/clock";
-  const data = await post(url, { pin: state.pendingPin });
+  const data = await post("/api/clock", { pin: state.pendingPin });
 
   if (!data.ok) {
     closePopup();
@@ -1131,7 +992,6 @@ function rejectWho() {
   logEvent("rejected_name", { pin: state.pendingPin });
   closePopup();
   state.pendingPin = null;
-  state.pendingEmail = null;
   clearPin();
 }
 
@@ -1158,80 +1018,6 @@ async function saveNewPin() {
 
   // PIN is theirs now — carry straight on into clocking in.
   state.pendingPin = state.setupValue;
-  state.pendingEmail = null;
-  showWhoPopup(data.name, false);
-}
-
-/* ---------- google ---------- */
-
-async function openGoogle() {
-  logEvent("google_tapped");
-  const data = await (await fetch("/api/google/accounts")).json();
-
-  el.accountList.innerHTML = "";
-  data.accounts.forEach(account => {
-    const b = document.createElement("button");
-    b.className = "account";
-
-    const av = document.createElement("span");
-    av.className = "avatar";
-    av.textContent = initials(account.name);
-
-    const box = document.createElement("span");
-    const n = document.createElement("div");
-    n.className = "account-name";
-    n.textContent = account.name;
-    const e = document.createElement("div");
-    e.className = "account-email";
-    e.textContent = account.email;
-    box.append(n, e);
-
-    b.append(av, box);
-    b.addEventListener("click", () => pickAccount(account.email));
-    el.accountList.appendChild(b);
-  });
-
-  openPopup("googlePicker");
-}
-
-async function pickAccount(email) {
-  const data = await post("/api/google/signin", { email });
-
-  if (data.state === "needs_link") {
-    // One-time link: prove who you are with the PIN, once.
-    state.pendingEmail = email;
-    state.linkValue = "";
-    el.linkEmail.textContent = email;
-    hideBanner(el.linkBanner);
-    renderLink();
-    openPopup("googleLink");
-    return;
-  }
-
-  state.pendingPin = data.pin;
-  state.pendingEmail = email;
-  showWhoPopup(data.name, data.clocked_in);
-}
-
-function renderLink() {
-  renderDots(el.linkDots, state.linkValue);
-  el.linkSave.disabled = state.linkValue.length < MIN_LEN;
-}
-
-async function saveLink() {
-  const data = await post("/api/google/link", {
-    email: state.pendingEmail,
-    pin: state.linkValue
-  });
-
-  if (!data.ok) {
-    showBanner(el.linkBanner, el.googleLink, data.message);
-    state.linkValue = "";
-    renderLink();
-    return;
-  }
-
-  state.pendingPin = data.pin;
   showWhoPopup(data.name, false);
 }
 
@@ -1264,7 +1050,6 @@ function showConfirmation(data) {
   resetTimer = setTimeout(() => {
     closePopup();
     state.pendingPin = null;
-    state.pendingEmail = null;
     clearPin();
   }, RESET_AFTER_MS);
 }
@@ -1273,7 +1058,7 @@ function showConfirmation(data) {
 
 // Every scan, from any source, comes through here. A camera scanner added
 // later just calls handleScan(code, "camera") with what it decoded.
-// A PIN setup, Google link or "is this you?" popup belongs to whoever is
+// A PIN setup or "is this you?" popup belongs to whoever is
 // using the kiosk right now; a card scan or NFC tap shouldn't clock someone
 // else in underneath it. The result screen is fine to replace: that's just
 // the next person in line.
@@ -1346,19 +1131,8 @@ buildNumpad(el.setupNumpad,
   () => { state.setupValue = state.setupValue.slice(0, -1); renderSetup(); }
 );
 
-buildNumpad(el.linkNumpad,
-  d => {
-    if (state.linkValue.length >= MAX_LEN) return;
-    state.linkValue += d;
-    hideBanner(el.linkBanner);
-    renderLink();
-  },
-  () => { state.linkValue = state.linkValue.slice(0, -1); renderLink(); }
-);
-
 el.btnEnter.addEventListener("click", submitPin);
 el.btnClear.addEventListener("click", clearPin);
-el.btnGoogle.addEventListener("click", openGoogle);
 
 el.whoYes.addEventListener("click", confirmWho);
 el.whoNo.addEventListener("click", rejectWho);
@@ -1366,8 +1140,6 @@ el.whoNo.addEventListener("click", rejectWho);
 el.setupSave.addEventListener("click", saveNewPin);
 el.setupCancel.addEventListener("click", () => { closePopup(); clearPin(); });
 
-el.googleCancel.addEventListener("click", () => { closePopup(); state.pendingEmail = null; });
-el.linkCancel.addEventListener("click", () => { closePopup(); state.pendingEmail = null; clearPin(); });
 
 /* ---------- barcode scanner + physical keyboard ---------- */
 
@@ -1548,7 +1320,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     border-radius: 6px;
     padding: 3px 8px;
   }
-  .google-cell { font-size: 13px; color: var(--muted); }
   .empty-row { text-align: center; color: var(--muted); padding: 34px; font-size: 15px; }
   tr.hidden { display: none; }
 
@@ -1586,6 +1357,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   .badge-cell { white-space: nowrap; }
   /* deliberately quiet: it only opens the confirmation page */
+  .row-links { white-space: nowrap; }
+  .name-link { color: inherit; text-decoration: none; }
+  .name-link:hover { text-decoration: underline; }
+  .id-link { font-size: 12px; color: var(--accent); text-decoration: none; margin-right: 10px; }
+  .id-link:hover { text-decoration: underline; }
   .remove-link { font-size: 12px; color: var(--muted); text-decoration: none; opacity: .7; white-space: nowrap; }
   .remove-link:hover { color: var(--err); opacity: 1; text-decoration: underline; }
   .inline { display: inline; }
@@ -1604,8 +1380,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   @media (max-width: 760px) {
     body { padding: 14px; }
-    /* hide the Google and ID card columns */
-    th:nth-child(5), td:nth-child(5), th:nth-child(6), td:nth-child(6) { display: none; }
+    /* hide the ID card column */
+    th:nth-child(5), td:nth-child(5) { display: none; }
   }
 </style>
 </head>
@@ -1671,20 +1447,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <button type="submit">Link card</button>
   </form>
   {{ nfc_panel }}
+  {{ digital_id_panel }}
+  {{ import_panel }}
   {% endif %}
 
   <div class="panel">
     <table>
       <thead>
         <tr>
-          <th>Employee</th><th>PIN</th><th>Status</th><th>Last punch</th><th>Google</th><th>ID card</th><th>Method</th><th></th>
+          <th>Employee</th><th>PIN</th><th>Status</th><th>Last punch</th><th>ID card</th><th>Method</th><th></th>
         </tr>
       </thead>
       <tbody id="rows">
         {% for p in punches %}
         <tr data-name="{{ p.name|lower }}" data-id="{{ p.id }}" data-badge="{{ p.badge|lower }}"
             data-status="{{ 'pending' if p.temporary else p.status }}">
-          <td class="name">{{ p.name }}</td>
+          <td class="name"><a class="name-link" href="/admin/employee/{{ p.id }}">{{ p.name }}</a></td>
           <td class="mono">{{ p.id }}</td>
           <td>
             {% if p.temporary %}
@@ -1696,7 +1474,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             {% endif %}
           </td>
           <td class="mono">{{ p.time }}</td>
-          <td class="google-cell">{{ p.google or '—' }}</td>
           <td class="badge-cell">
             {% if p.badge %}
               <span class="mono">{{ p.badge }}</span>
@@ -1709,11 +1486,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             {% endif %}
           </td>
           <td><span class="tag">{{ p.method }}</span></td>
-          <td><a class="remove-link" href="/admin/remove/{{ p.id }}">Remove…</a></td>
+          <td class="row-links"><a class="id-link" href="/admin/employee/{{ p.id }}">Edit</a>
+              <a class="id-link" href="/digital-id/{{ p.id }}">Digital ID</a>
+              <a class="remove-link" href="/admin/remove/{{ p.id }}">Remove…</a></td>
         </tr>
         {% endfor %}
         <tr id="emptyRow" class="{% if punches %}hidden{% endif %}">
-          <td class="empty-row" colspan="8">
+          <td class="empty-row" colspan="7">
             {% if punches %}No employees match that search.
             {% else %}Nobody registered yet — add someone above.{% endif %}
           </td>
@@ -1811,7 +1590,6 @@ REMOVE_HTML = """<!DOCTYPE html>
       <li>Their record is deleted and PIN <b>{{ pin }}</b> becomes free for someone else.</li>
       {% set linked = [] %}
       {% if record.badge %}{% set _ = linked.append("ID card") %}{% endif %}
-      {% if record.google_email %}{% set _ = linked.append("Google account") %}{% endif %}
       {% if phones %}{% set _ = linked.append(phones ~ " remembered phone" ~ ("s" if phones != 1 else "")) %}{% endif %}
       {% if linked %}
       <li>Their linked {{ linked[:-1]|join(", ") ~ (" and " if linked|length > 1 else "") ~ linked[-1] }}
@@ -1860,15 +1638,30 @@ typed.addEventListener("paste", e => e.preventDefault());
 """
 
 
+# Digital ID cards live in their own module (digitalID.py). Registered here,
+# below BASE_CSS, because the ID page reuses the same styles.
+app.register_blueprint(digitalID.create_blueprint(log_event, BASE_CSS, SITE_LABEL))
+
+# Spreadsheet import and the edit-employee page (staffadmin.py).
+app.register_blueprint(staffadmin.create_blueprint(
+    log_event, BASE_CSS, SITE_LABEL, move_pin_state, status_corrected))
+
+
 if __name__ == "__main__":
-    # debug=True reloads the process, which would re-seed and hand out a
-    # second set of codes, so only seed in the real (reloaded) worker.
+    # The reloader restarts the server whenever a .py file is saved. It runs
+    # the code twice (a watcher, then the real worker), so seed only in the
+    # worker, or the demo staff would get a second set of codes.
     if os.environ.get("WERKZEUG_RUN_MAIN") == "true":
         seed_demo_staff()
+
+    # Flask's interactive debugger lets anyone who sees an error page run
+    # Python on this computer, and phones on the Wi-Fi can reach it, so it's
+    # off unless asked for: KIOSK_DEBUG=1 python app.py
+    debug = os.environ.get("KIOSK_DEBUG") == "1"
 
     # host="0.0.0.0" so the Android tablet on the same network can reach it.
     # Web NFC on the tablet needs https. KIOSK_HTTPS=1 python app.py serves
     # over https with a throwaway self-signed certificate (needs the
     # "cryptography" package); the tablet shows a warning to accept once.
     ssl = "adhoc" if os.environ.get("KIOSK_HTTPS") == "1" else None
-    app.run(host="0.0.0.0", port=5000, debug=True, ssl_context=ssl)
+    app.run(host="0.0.0.0", port=5000, debug=debug, use_reloader=True, ssl_context=ssl)
