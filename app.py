@@ -41,6 +41,7 @@ through one function, handleScan(code, source), so a camera scanner can be
 added later by calling that same function.
 """
 
+import json
 import os
 import threading
 import time
@@ -135,11 +136,42 @@ def seed_demo_staff():
 
     issued = cs.register_employee("New Hire")
     cs.link_badge(issued, "100999")
-    print(f"[seed] New Hire -> temporary code {issued}, card 100999 "
-          f"(will be asked to pick a PIN)")
+    if cs.pins_assigned():
+        print(f"[seed] New Hire -> assigned PIN {issued}, card 100999")
+    else:
+        print(f"[seed] New Hire -> temporary code {issued}, card 100999 "
+              f"(will be asked to pick a PIN)")
 
 
 SITE_LABEL = "Main Office"
+
+
+# ---------------------------------------------------------------------
+# Saved settings (currently just the PIN policy), kept next to the NFC
+# tag's code so Docker's data volume keeps both across restarts.
+# ---------------------------------------------------------------------
+SETTINGS_FILE = os.path.join(
+    os.environ.get("NFC_DATA_DIR") or os.path.dirname(os.path.abspath(__file__)),
+    "kiosk_settings.json",
+)
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE) as f:
+            mode = json.load(f).get("pin_mode", cs.PIN_MODE_CHOOSE)
+    except (FileNotFoundError, ValueError):
+        return
+    if mode in (cs.PIN_MODE_CHOOSE, cs.PIN_MODE_ASSIGNED):
+        cs.set_pin_mode(mode)
+
+
+def save_settings():
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump({"pin_mode": cs.pin_mode}, f)
+
+
+load_settings()
 
 
 def record_punch(pin, method):
@@ -244,12 +276,34 @@ def dashboard():
         today=f"{datetime.now():%A, %B} {datetime.now().day}, {datetime.now():%Y}",
         new_pin=request.args.get("pin"),
         new_name=request.args.get("name"),
+        pins_assigned=cs.pins_assigned(),
         nfc_panel=nfctag.admin_panel(),
         digital_id_panel=digitalID.admin_panel(),
         import_panel=staffadmin.admin_panel(),
         notice=request.args.get("notice"),
         notice_kind=request.args.get("kind", "ok"),
     )
+
+
+@app.route("/admin/pin-mode", methods=["POST"])
+def change_pin_mode():
+    """Admin switches between employees choosing PINs and assigned PINs."""
+    mode = request.form.get("pin_mode")
+    if mode not in (cs.PIN_MODE_CHOOSE, cs.PIN_MODE_ASSIGNED):
+        return redirect(url_for("dashboard", notice="Pick one of the two PIN options.", kind="error"))
+    if mode == cs.pin_mode:
+        return redirect(url_for("dashboard", notice="That's already the PIN setting.", kind="ok"))
+    finalized = cs.set_pin_mode(mode)
+    save_settings()
+    log_event("pin_mode_changed", {"mode": mode, "codes_made_permanent": finalized})
+    if mode == cs.PIN_MODE_ASSIGNED:
+        notice = "PINs are now assigned by the system. New staff get a random PIN and can't choose."
+        if finalized:
+            notice += (f" {finalized} employee{'s' if finalized != 1 else ''} still on a temporary code"
+                       f" keep{'s' if finalized == 1 else ''} it as their PIN.")
+    else:
+        notice = "Employees now choose their own PIN. New staff get a temporary code first; existing PINs don't change."
+    return redirect(url_for("dashboard", notice=notice, kind="ok"))
 
 
 @app.route("/register", methods=["POST"])
@@ -378,6 +432,11 @@ def api_set_pin():
     payload = request.get_json(silent=True) or {}
     current = cs.clean_pin(payload.get("current_pin"))
     chosen = cs.clean_pin(payload.get("new_pin"))
+
+    # When PINs are assigned, nobody chooses one, even by calling this directly.
+    if cs.pins_assigned():
+        log_event("set_pin", {"from": current, "result": cs.PINS_ARE_ASSIGNED})
+        return jsonify({"ok": False, "message": "PINs are assigned by your site. Use the PIN you were given."})
 
     result = cs.set_custom_pin(current, chosen)
     log_event("set_pin", {"from": current, "result": result})
@@ -1245,6 +1304,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   input[type="search"] { flex: 1; min-width: 200px; }
   input:focus, select:focus { outline: none; border-color: var(--accent); }
 
+  .pin-policy { align-items: center; }
+  .pin-policy .choice { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--text);
+    cursor: pointer; white-space: nowrap; }
+  .pin-policy .choice input { width: 18px; height: 18px; }
   .register { display: flex; gap: 8px; margin-left: auto; }
   .register button {
     background: var(--accent);
@@ -1403,8 +1466,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   {% if new_pin %}
   <div class="pin-callout">
     <div>
+      {% if pins_assigned %}
+      <div class="pin-callout-label">PIN for {{ new_name }}</div>
+      <p class="sub">Give it to them now. This is their PIN; they can't change it.</p>
+      {% else %}
       <div class="pin-callout-label">Temporary code for {{ new_name }}</div>
       <p class="sub">Give it to them now. They'll choose their own PIN at the kiosk.</p>
+      {% endif %}
     </div>
     <div class="pin-callout-pin">{{ new_pin }}</div>
   </div>
@@ -1413,9 +1481,38 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="tiles">
     <div class="tile on">     <div class="tile-label">On shift</div>     <div class="tile-value">{{ counts.on }}</div></div>
     <div class="tile">        <div class="tile-label">Clocked out</div>  <div class="tile-value">{{ counts.out }}</div></div>
+    {% if not pins_assigned or counts.pending %}
     <div class="tile pending"><div class="tile-label">PIN not set</div>  <div class="tile-value">{{ counts.pending }}</div></div>
+    {% endif %}
     <div class="tile">        <div class="tile-label">Total staff</div>  <div class="tile-value">{{ counts.all }}</div></div>
   </div>
+
+  <form class="card-link pin-policy" method="post" action="/admin/pin-mode"
+        onsubmit='return confirmPinMode(this)'>
+    <div class="card-link-text">
+      <div class="card-link-title">PIN policy</div>
+      <p class="sub">{{ 'PINs are assigned by the system. Staff use the PIN they are given.' if pins_assigned
+                       else 'Staff get a temporary code, then choose their own PIN at the kiosk.' }}</p>
+    </div>
+    <label class="choice"><input type="radio" name="pin_mode" value="choose" {{ '' if pins_assigned else 'checked' }}>
+      Employees choose their own PIN</label>
+    <label class="choice"><input type="radio" name="pin_mode" value="assigned" {{ 'checked' if pins_assigned else '' }}>
+      Assign each employee a random PIN</label>
+    <button type="submit">Save</button>
+  </form>
+  <script>
+    // Switching to assigned PINs turns pending temporary codes into permanent
+    // PINs, so say so before it happens.
+    function confirmPinMode(form) {
+      const mode = form.pin_mode.value;
+      const pending = {{ counts.pending }};
+      if (mode === "assigned" && !{{ pins_assigned|tojson }}) {
+        return confirm("Switch to assigned PINs? New staff will get a random PIN they can't change."
+          + (pending ? "\\n\\n" + pending + " employee(s) still on a temporary code will keep that code as their permanent PIN." : ""));
+      }
+      return true;
+    }
+  </script>
 
   <div class="controls">
     <input type="search" id="search" placeholder="Search by name, PIN or card…" autocomplete="off">
@@ -1423,11 +1520,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <option value="all">All statuses</option>
       <option value="in">On shift</option>
       <option value="out">Clocked out</option>
-      <option value="pending">PIN not set</option>
+      {% if not pins_assigned or counts.pending %}<option value="pending">PIN not set</option>{% endif %}
     </select>
     <form class="register" method="post" action="/register">
       <input type="text" name="name" placeholder="New employee name" autocomplete="off" required>
-      <button type="submit">Register &amp; issue code</button>
+      <button type="submit">Register &amp; {{ 'assign PIN' if pins_assigned else 'issue code' }}</button>
     </form>
   </div>
 
