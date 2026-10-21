@@ -43,6 +43,7 @@ NEW employee
 """
 
 import random
+import time
 from typing import Dict, Optional
 
 TEMP_PIN_LENGTH = 4       # length of the generated code handed to new hires
@@ -96,6 +97,7 @@ employee_records: Dict[str, Dict] = {}
 #       "temporary": True,        # still the issued code, not self-chosen
 #       "google_email": None,
 #       "badge": None,            # barcode value from their school ID card
+#       "since": None,            # time.time() they clocked in; None when out
 #   }
 
 
@@ -176,6 +178,7 @@ def register_employee(name: str) -> str:
         "temporary": True,
         "google_email": None,
         "badge": None,
+        "since": None,
     }
     return new_pin
 
@@ -271,11 +274,15 @@ def process_clock_entry(pin: str) -> str:
     if record["temporary"]:
         return NEEDS_PIN_SETUP
 
+    # "since" is kept right here with the status, so no matter which method
+    # flipped the lever (PIN, card, NFC), the shift start time is never stale.
     if record["status"] == "clocked_out":
         record["status"] = "clocked_in"
+        record["since"] = time.time()
         return CLOCKED_IN
     else:
         record["status"] = "clocked_out"
+        record["since"] = None
         return CLOCKED_OUT
 
 
@@ -383,6 +390,26 @@ def unlink_badge(pin: str) -> str:
 
     record["badge"] = None
     return BADGE_UNLINKED
+
+
+# ---------------------------------------------------------------------
+# 8b. Admin: put someone back on a fresh temporary code (forgot their PIN)
+# ---------------------------------------------------------------------
+def reset_to_temporary_code(pin: str) -> Optional[str]:
+    """
+    Moves an employee onto a newly issued temporary code, as if they were a
+    new hire again: next time they enter it at the kiosk they choose a new
+    PIN. Returns the new code, or None if `pin` isn't registered.
+    Everything else on their record (name, card, clock status) is kept.
+    """
+    pin = clean_pin(pin)
+    if pin not in employee_records:
+        return None
+    new_code = generate_unique_pin()
+    record = employee_records.pop(pin)
+    record["temporary"] = True
+    employee_records[new_code] = record
+    return new_code
 
 
 # ---------------------------------------------------------------------
